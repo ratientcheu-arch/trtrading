@@ -1,0 +1,127 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-db
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: ${DB_USER:-trading}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── API process (uvicorn) — API-only, always responsive ──────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "asyncio"]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${DB_USER:-trading}:${DB_PASSWORD}@postgres:5432/trading"
+      API_KEY: ${API_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://day-trading.pages.dev}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STARTING_CAPITAL: ${STARTING_CAPITAL:-1600.0}
+      BOT_IPC_DIR: /ipc
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ipc-data:/ipc
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Bot process — talks to MT5 via ZMQ (no Twisted / no OAuth) ────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading-bot
+    command: ["python", "-m", "app.bot_runner"]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${DB_USER:-trading}:${DB_PASSWORD}@postgres:5432/trading"
+      API_KEY: ${API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STARTING_CAPITAL: ${STARTING_CAPITAL:-1600.0}
+      MAX_ORDER_SIZE: ${MAX_ORDER_SIZE:-150.0}
+      MAX_RISK_PER_TRADE: ${MAX_RISK_PER_TRADE:-0.03}
+      MAX_DAILY_LOSS: ${MAX_DAILY_LOSS:-0.06}
+      MAX_OPEN_POSITIONS: ${MAX_OPEN_POSITIONS:-10}
+      BOT_IPC_DIR: /ipc
+      # MT5 bridge (ZMQ localhost transport to the mt5-bridge container)
+      MT5_ENABLED: ${MT5_ENABLED:-true}
+      MT5_PUB_ENDPOINT: ${MT5_PUB_ENDPOINT:-tcp://mt5-bridge:5555}
+      MT5_REP_ENDPOINT: ${MT5_REP_ENDPOINT:-tcp://mt5-bridge:5556}
+      MT5_RPC_TIMEOUT_S: ${MT5_RPC_TIMEOUT_S:-10.0}
+    volumes:
+      - ipc-data:/ipc
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mt5-bridge:
+        condition: service_started
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: trading-proxy
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── MT5 bridge — Wine + MT5 terminal + EA ZMQ ──────────────────────
+  # Bot talks to MT5 via ZMQ localhost (ports 5555/5556 exposed by the EA).
+  # Phase 1: proof-of-life (balance visible in logs).
+  # Phase 2+: ZMQ PUB ticks (5555) + REP orders (5556) consumed by bot.
+  mt5-bridge:
+    build:
+      context: ./mt5-bridge
+      dockerfile: Dockerfile
+    container_name: trading-mt5-bridge
+    environment:
+      MT5_LOGIN: ${MT5_LOGIN}
+      MT5_PASSWORD: ${MT5_PASSWORD}
+      MT5_SERVER: ${MT5_SERVER:-FusionMarkets-Live}
+      TZ: Europe/Paris
+    ports:
+      # VNC on localhost only — used for first-time MT5 login troubleshooting
+      - "127.0.0.1:5900:5900"
+      # ZMQ PUB (ticks) and REP (orders) exposed on host loopback for the bot
+      - "127.0.0.1:5555:5555"
+      - "127.0.0.1:5556:5556"
+    volumes:
+      # Persist Wine prefix across restarts so MT5 doesn't re-install each boot
+      - mt5-wine:/root/.wine
+    shm_size: "512m"
+    # Memory cap to avoid OOM-killing other containers on 2GB droplet
+    mem_limit: 900m
+    mem_reservation: 500m
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy-data:
+  caddy-config:
+  mt5-wine:
+  ipc-data:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=10m

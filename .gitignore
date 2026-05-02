@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# Wrangler
+.wrangler/

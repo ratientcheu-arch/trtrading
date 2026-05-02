@@ -1,0 +1,28 @@
+# Replace YOUR_DOMAIN with your actual domain pointing to the DigitalOcean server
+# Example: api.day-trading.example.com
+#
+# Caddy will automatically provision a Let's Encrypt TLS certificate.
+
+api-trading.tr-tp.com {
+	reverse_proxy backend:8000
+
+	# WebSocket support
+	@websocket {
+		header Connection *upgrade*
+		header Upgrade websocket
+	}
+	reverse_proxy @websocket backend:8000
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Logging
+	log {
+		output stdout
+		format console
+	}
+}
