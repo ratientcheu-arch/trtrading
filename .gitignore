@@ -20,3 +20,4 @@ venv/
 
 # Wrangler
 .wrangler/
+day-trading-app/package-lock.json
