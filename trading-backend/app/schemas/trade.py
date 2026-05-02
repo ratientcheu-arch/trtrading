@@ -19,6 +19,10 @@ class ExpectOperatorOrderRequest(BaseModel):
     ttl_seconds: int = 600  # 10 min window
 
 
+class ModifySLRequest(BaseModel):
+    new_sl: float
+
+
 class ReclassifyPositionRequest(BaseModel):
     origin: str  # "operator", "orphan", or "bot"
 

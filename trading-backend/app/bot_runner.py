@@ -118,6 +118,36 @@ async def process_command(cmd: dict):
             send_response(cmd_id, result.get("success", False), data=result,
                           error=result.get("error"))
 
+        elif cmd_name == "modify_sl":
+            if not bot or not bot.mt5_available:
+                send_response(cmd_id, False, error="MT5 not connected")
+                return
+            try:
+                ticket = int(params.get("ticket", 0))
+                new_sl = float(params.get("new_sl", 0))
+            except (TypeError, ValueError):
+                send_response(cmd_id, False, error="Invalid ticket or new_sl")
+                return
+            if ticket <= 0 or new_sl <= 0:
+                send_response(cmd_id, False, error="ticket and new_sl must be > 0")
+                return
+            # Fetch current TP to preserve it (amend_position_sltp sends both)
+            current_tp = None
+            try:
+                positions = await bot.mt5.get_positions()
+                for pos in positions:
+                    if pos.get("ticket") == ticket:
+                        current_tp = pos.get("take_profit") or None
+                        break
+            except Exception as e:
+                logger.warning(f"[modify_sl] Could not fetch current TP for {ticket}: {e}")
+            ok = await bot.mt5.amend_position_sltp(ticket, stop_loss=new_sl, take_profit=current_tp)
+            if ok:
+                logger.info(f"[modify_sl] ticket={ticket} new_sl={new_sl} tp_preserved={current_tp}")
+                send_response(cmd_id, True, data={"ticket": ticket, "new_sl": new_sl, "tp": current_tp})
+            else:
+                send_response(cmd_id, False, error="Broker rejected SL modification")
+
         elif cmd_name == "close_position_direct":
             # Fallback: close directly on MT5 (when bot doesn't track the position)
             if not bot or not bot.mt5_available:

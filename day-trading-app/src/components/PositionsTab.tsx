@@ -3,7 +3,7 @@
  * trades fermés permanents du plus récent au plus ancien.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Clock, CheckCircle, Activity, XCircle, Square, Calendar, Filter, ArrowDown, Target, Shield, Timer, Zap, TrendingUp, TrendingDown } from 'lucide-react';
+import { Clock, CheckCircle, Activity, XCircle, Square, Calendar, Filter, ArrowDown, Target, Shield, Timer, Zap, TrendingUp, TrendingDown, Edit3 } from 'lucide-react';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || '';
 const API_KEY = import.meta.env.VITE_API_KEY || '';
@@ -71,6 +71,9 @@ export default function PositionsTab() {
   const [brokerFilter, setBrokerFilter] = useState('all');
   const [closing, setClosing] = useState<string | null>(null);
   const [expandedTicket, setExpandedTicket] = useState<number | null>(null);
+  const [editingSL, setEditingSL] = useState<number | null>(null);
+  const [slInput, setSlInput] = useState('');
+  const [modifyingSL, setModifyingSL] = useState(false);
   const prevPnl = useRef<Record<string, number>>({});
 
   // Fast refresh for live positions (every 2s)
@@ -138,6 +141,37 @@ export default function PositionsTab() {
     }
     setTimeout(fetchPositions, 1000);
     setClosing(null);
+  };
+
+  const modifySL = async (ticket: number, currentSL: number, entryPrice: number, isBuy: boolean) => {
+    const newSL = parseFloat(slInput);
+    if (isNaN(newSL) || newSL <= 0) { alert('SL invalide'); return; }
+    // Validation min gap (5 pips)
+    const sym = livePositions.find(p => p.ticket === ticket)?.symbol || '';
+    const pipSize = sym.includes('JPY') ? 0.01 : (sym.includes('/') ? 0.0001 : 1);
+    const minGap = 5 * pipSize;
+    const currentPrice = livePositions.find(p => p.ticket === ticket)?.current_price || 0;
+    if (isBuy && currentPrice - newSL < minGap) { alert(`SL trop proche du prix actuel (min 5 pips)`); return; }
+    if (!isBuy && newSL - currentPrice < minGap) { alert(`SL trop proche du prix actuel (min 5 pips)`); return; }
+    // Confirmation si SL en zone perte
+    const isLossSL = isBuy ? newSL < entryPrice : newSL > entryPrice;
+    if (isLossSL && !confirm(`Le nouveau SL (${newSL}) est en zone de PERTE. Confirmer ?`)) return;
+
+    setModifyingSL(true);
+    try {
+      const resp = await fetch(`${BACKEND_URL}/api/positions/${ticket}/modify_sl`, {
+        method: 'POST', headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_sl: newSL }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: 'Erreur inconnue' }));
+        alert(`Erreur: ${err.detail || 'Echec modification SL'}`);
+      } else {
+        setEditingSL(null);
+        setTimeout(fetchPositions, 500);
+      }
+    } catch (e) { alert(`Erreur réseau: ${e}`); }
+    setModifyingSL(false);
   };
 
   // Closed trades from history
@@ -395,6 +429,12 @@ export default function PositionsTab() {
                           <Clock className="w-3 h-3" />
                           {fmtDur(dur)}
                         </div>
+                        <button onClick={(e) => { e.stopPropagation(); setEditingSL(editingSL === p.ticket ? null : (p.ticket || null)); setSlInput(sl > 0 ? sl.toFixed(dec) : ''); }}
+                          disabled={modifyingSL}
+                          className="px-3 py-1.5 rounded-lg bg-orange-500 text-white text-[11px] font-bold hover:bg-orange-600 disabled:opacity-50 flex items-center gap-1 shadow-sm transition-colors">
+                          <Edit3 className="w-3.5 h-3.5" />
+                          SL
+                        </button>
                         <button onClick={(e) => { e.stopPropagation(); closePosition(p.symbol); }}
                           disabled={closing === p.symbol || closing === 'ALL'}
                           className="px-3 py-1.5 rounded-lg bg-red-500 text-white text-[11px] font-bold hover:bg-red-600 disabled:opacity-50 flex items-center gap-1 shadow-sm transition-colors">
@@ -590,6 +630,19 @@ export default function PositionsTab() {
                       </div>
                       );
                     })()}
+
+                    {/* SL drag slider — appears on click */}
+                    {editingSL === p.ticket && p.ticket && (
+                      <SlDragSlider
+                        position={p}
+                        decimals={dec}
+                        currentDraggedSL={slInput ? parseFloat(slInput) : sl}
+                        onDrag={(price) => setSlInput(price.toString())}
+                        onConfirm={() => modifySL(p.ticket!, p.stop_loss, p.entry_price, isBuy)}
+                        onCancel={() => { setEditingSL(null); setSlInput(''); }}
+                        modifying={modifyingSL}
+                      />
+                    )}
                   </div>
                 </div>
               );
@@ -752,3 +805,198 @@ function decs(symbol: string, price: number): number {
 
 function pc(v: number) { return v >= 0 ? 'text-green-600' : 'text-red-600'; }
 function fmt(v: number) { return `${v >= 0 ? '+' : ''}${v.toFixed(2)}`; }
+
+/* ─── SL Drag Slider Component ─── */
+
+interface SlDragSliderProps {
+  position: LivePos;
+  decimals: number;
+  currentDraggedSL: number;
+  onDrag: (price: number) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+  modifying: boolean;
+}
+
+function SlDragSlider({ position: p, decimals, currentDraggedSL, onDrag, onConfirm, onCancel, modifying }: SlDragSliderProps) {
+  const isBuy = p.action === 'BUY';
+  const entry = p.entry_price;
+  const currentPrice = p.current_price;
+  const origSL = p.stop_loss > 0 ? p.stop_loss : entry;
+  const tp = p.take_profit > 0 ? p.take_profit : entry;
+
+  // Range: span 1.5x SL distance below entry to ~95% TP above entry (for BUY)
+  const slDist = Math.abs(entry - origSL) || Math.abs(entry * 0.01); // fallback 1%
+  const tpDist = Math.abs(tp - entry) || slDist * 2;
+
+  // For BUY: rangeMin (worst SL = lowest price), rangeMax (best SL near TP = highest price)
+  // For SELL: inverted
+  const rangeMin = isBuy ? entry - slDist * 1.5 : entry - tpDist * 0.95;
+  const rangeMax = isBuy ? entry + tpDist * 0.95 : entry + slDist * 1.5;
+  const range = rangeMax - rangeMin;
+
+  const barRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState(false);
+
+  // Convert price → bar position [0, 100]
+  const priceToBarPct = useCallback((price: number) => {
+    return Math.max(0, Math.min(100, ((price - rangeMin) / range) * 100));
+  }, [rangeMin, range]);
+
+  // Convert clientX → price
+  const clientXToPrice = useCallback((clientX: number) => {
+    if (!barRef.current) return currentDraggedSL;
+    const rect = barRef.current.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return rangeMin + pct * range;
+  }, [rangeMin, range, currentDraggedSL]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDragging(true);
+  };
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: MouseEvent) => {
+      const price = clientXToPrice(e.clientX);
+      onDrag(parseFloat(price.toFixed(decimals)));
+    };
+    const onUp = () => setDragging(false);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [dragging, clientXToPrice, onDrag, decimals]);
+
+  // Touch support
+  const handleTouchStart = (e: React.TouchEvent) => {
+    e.stopPropagation();
+    setDragging(true);
+  };
+  useEffect(() => {
+    if (!dragging) return;
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length > 0) {
+        const price = clientXToPrice(e.touches[0].clientX);
+        onDrag(parseFloat(price.toFixed(decimals)));
+      }
+    };
+    const onTouchEnd = () => setDragging(false);
+    window.addEventListener('touchmove', onTouchMove);
+    window.addEventListener('touchend', onTouchEnd);
+    return () => {
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onTouchEnd);
+    };
+  }, [dragging, clientXToPrice, onDrag, decimals]);
+
+  // Click on bar = jump handle there
+  const handleBarClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const price = clientXToPrice(e.clientX);
+    onDrag(parseFloat(price.toFixed(decimals)));
+  };
+
+  // P&L preview at new SL
+  const newSL = currentDraggedSL;
+  const slDistFromEntry = isBuy ? newSL - entry : entry - newSL;
+  const conv = p.pnl_conv_rate ?? 0.87;
+  const slPnl = slDistFromEntry * p.quantity * conv;
+  const isLossZone = slDistFromEntry < 0;
+  const isProfitLocked = slDistFromEntry > 0;
+
+  const newSlPct = priceToBarPct(newSL);
+  const entryPct = priceToBarPct(entry);
+  const currentPct = priceToBarPct(currentPrice);
+  const origSlPct = priceToBarPct(origSL);
+
+  return (
+    <div className="mt-3 mx-4 p-3 bg-orange-50 border border-orange-200 rounded-lg" onClick={(e) => e.stopPropagation()}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-bold text-orange-700">
+          Glisser pour déplacer le SL
+        </span>
+        <span className="text-[11px] text-gray-600">
+          Nouveau SL : <b className="text-orange-700">{newSL.toFixed(decimals)}</b>
+          <span className={`ml-2 font-bold ${isProfitLocked ? 'text-green-600' : isLossZone ? 'text-red-600' : 'text-gray-500'}`}>
+            ({slPnl >= 0 ? '+' : ''}{slPnl.toFixed(2)} €)
+          </span>
+        </span>
+      </div>
+
+      {/* Slider bar */}
+      <div ref={barRef}
+        onClick={handleBarClick}
+        className="relative h-8 bg-gray-200 rounded-full cursor-pointer select-none"
+        style={{ touchAction: 'none' }}>
+
+        {/* Loss zone (red gradient) */}
+        <div className="absolute top-0 h-full bg-gradient-to-r from-red-300 to-red-100 rounded-l-full"
+          style={{ left: 0, width: `${entryPct}%` }} />
+        {/* Profit zone (green gradient) */}
+        <div className="absolute top-0 h-full bg-gradient-to-r from-green-100 to-green-300 rounded-r-full"
+          style={{ left: `${entryPct}%`, width: `${100 - entryPct}%` }} />
+
+        {/* Original SL position (faded) */}
+        <div className="absolute top-1/2 -translate-y-1/2 w-2 h-6 bg-gray-400 rounded opacity-60"
+          style={{ left: `calc(${origSlPct}% - 4px)` }}>
+          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[8px] text-gray-500 whitespace-nowrap">SL₀</div>
+        </div>
+
+        {/* Entry marker */}
+        <div className="absolute top-0 bottom-0 w-[3px] bg-blue-600 z-10"
+          style={{ left: `calc(${entryPct}% - 1.5px)` }}>
+          <div className="absolute -top-4 left-1/2 -translate-x-1/2 text-[9px] font-bold text-blue-600">E</div>
+        </div>
+
+        {/* Current price */}
+        <div className={`absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full border-2 border-white shadow z-15 ${p.pnl >= 0 ? 'bg-green-600' : 'bg-red-600'}`}
+          style={{ left: `calc(${currentPct}% - 6px)` }} />
+
+        {/* Draggable SL handle */}
+        <div
+          onMouseDown={handleMouseDown}
+          onTouchStart={handleTouchStart}
+          className={`absolute top-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-[3px] border-white shadow-lg z-20 cursor-grab active:cursor-grabbing transition-transform ${dragging ? 'scale-125' : 'hover:scale-110'} ${isProfitLocked ? 'bg-green-500' : 'bg-orange-500'}`}
+          style={{ left: `calc(${newSlPct}% - 14px)` }}
+          title="Glisser pour déplacer le SL"
+        >
+          <div className="absolute inset-0 flex items-center justify-center text-white text-[10px] font-bold">SL</div>
+        </div>
+      </div>
+
+      {/* Scale labels */}
+      <div className="flex justify-between mt-1 text-[9px] text-gray-500">
+        <span>{rangeMin.toFixed(decimals)}</span>
+        <span className="text-blue-600 font-bold">Entry: {entry.toFixed(decimals)}</span>
+        <span>{rangeMax.toFixed(decimals)}</span>
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex items-center justify-end gap-2 mt-3">
+        {isLossZone && (
+          <span className="text-[10px] text-red-600 font-bold mr-auto">
+            ⚠️ SL en zone de PERTE
+          </span>
+        )}
+        {isProfitLocked && (
+          <span className="text-[10px] text-green-600 font-bold mr-auto">
+            ✓ SL verrouille en profit
+          </span>
+        )}
+        <button onClick={onCancel} disabled={modifying}
+          className="px-3 py-1.5 bg-gray-200 text-gray-700 text-xs font-bold rounded-lg hover:bg-gray-300 disabled:opacity-50">
+          Annuler
+        </button>
+        <button onClick={onConfirm} disabled={modifying || newSL <= 0}
+          className="px-4 py-1.5 bg-orange-600 text-white text-xs font-bold rounded-lg hover:bg-orange-700 disabled:opacity-50">
+          {modifying ? 'Envoi...' : 'Confirmer SL'}
+        </button>
+      </div>
+    </div>
+  );
+}

@@ -14,7 +14,7 @@ from app.config import settings
 from app.schemas.trade import (
     ManualOrderRequest, ClosePositionRequest, BotConfigUpdate,
     AccountResponse, HealthResponse,
-    ExpectOperatorOrderRequest, ReclassifyPositionRequest,
+    ExpectOperatorOrderRequest, ReclassifyPositionRequest, ModifySLRequest,
 )
 from app.api.websocket import ws_manager
 from app.utils.logging import get_logger
@@ -299,6 +299,21 @@ async def close_position(req: ClosePositionRequest):
     if result2.get("success"):
         return result2.get("data", result2)
     return result.get("data", result)
+
+
+@router.post("/positions/{ticket}/modify_sl", dependencies=[Depends(verify_api_key)])
+async def modify_position_sl(ticket: int, req: ModifySLRequest):
+    """Modify Stop Loss on an open position (synchronous broker call)."""
+    if req.new_sl <= 0:
+        raise HTTPException(status_code=400, detail="new_sl must be > 0")
+    result = await send_command("modify_sl", {
+        "ticket": ticket,
+        "new_sl": req.new_sl,
+    }, timeout=15)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to modify SL"))
+    logger.info(f"[AUDIT] modify_sl ticket={ticket} new_sl={req.new_sl} result=OK")
+    return {"success": True, "ticket": ticket, "new_sl": req.new_sl}
 
 
 # ── Operator Order Management ──────────────────────────────────────────
