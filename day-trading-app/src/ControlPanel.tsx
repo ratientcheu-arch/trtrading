@@ -47,7 +47,7 @@ export default function ControlPanel({ backend }: ControlPanelProps) {
 
   const TRADEABLE_SYMBOLS = [
     // Forex
-    'GBP/USD', 'USD/JPY', 'EUR/GBP', 'AUD/USD', 'NZD/USD', 'EUR/JPY', 'GBP/JPY',
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'EUR/GBP', 'AUD/USD', 'NZD/USD', 'EUR/JPY', 'GBP/JPY',
     'EUR/CAD', 'EUR/CHF', 'EUR/AUD', 'GBP/AUD', 'AUD/JPY', 'AUD/CHF', 'AUD/NZD',
     'USD/CAD', 'USD/CHF',
     // Indices
