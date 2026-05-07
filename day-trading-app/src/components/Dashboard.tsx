@@ -631,8 +631,8 @@ export default function Dashboard({ backend }: DashboardProps) {
   const [confirmOrder, setConfirmOrder] = useState(false);
 
   const TRADEABLE_SYMBOLS = [
-    'GBP/USD', 'USD/JPY', 'EUR/GBP', 'AUD/USD', 'NZD/USD', 'EUR/JPY',
-    'GBP/JPY', 'EUR/CAD', 'EUR/CHF', 'USD/CHF', 'AUD/NZD', 'GBP/NZD',
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'EUR/GBP', 'AUD/USD', 'NZD/USD', 'EUR/JPY',
+    'GBP/JPY', 'EUR/CAD', 'EUR/CHF', 'USD/CHF', 'USD/CAD', 'AUD/NZD', 'GBP/NZD',
     'CAD/JPY', 'NZD/JPY', 'EUR/AUD', 'GBP/CAD',
     'DAX40', 'SP500', 'NASDAQ', 'CAC40', 'NKY', 'HK50', 'AUS200',
     'UK100', 'US30',  // 2026-04-24: ajout indices US30 + UK100
