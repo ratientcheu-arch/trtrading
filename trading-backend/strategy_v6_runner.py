@@ -39,11 +39,14 @@ TP_EUR_MIN_MOMENTUM = 29.0  # TP min MOMENTUM (Fibo+best-of, R:R 2.0)
 TP_EUR_MIN_ORB      = 21.0  # TP min ORB-Retest (range x1.05/x1.5, R:R 1.43)
 TP_EUR_MIN = TP_EUR_MIN_MOMENTUM  # legacy alias (non utilise par compute_lot apres fix)
 CUT_LOSS_ENABLED = False    # 2026-05-08 sans limite SL pour validation strategy
-# Fix rollover Fusion Markets 2026-05-06 : pas de trade dans cette fenetre Paris (server time UTC+3 -> 22:30 Paris = 01:30 server, mais en pratique broker bloque ~22:30 - 00:30)
-ROLLOVER_START_H = 21
+# Rollover Fusion Markets : 00:00 serveur (UTC+3) = 23:00 Paris
+# Fenetre resserree 22:50 - 23:15 Paris (25 min) + close positions avant
+ROLLOVER_START_H = 22
 ROLLOVER_START_M = 50
-ROLLOVER_END_H = 1
-ROLLOVER_END_M = 30
+ROLLOVER_END_H = 23
+ROLLOVER_END_M = 15
+ROLLOVER_CLOSE_H = 22
+ROLLOVER_CLOSE_M = 49
 
 def in_rollover_window(now_paris=None):
     """True si on est dans la fenetre rollover Fusion Markets."""
@@ -287,6 +290,22 @@ async def d1_breakout_scanner(c):
             today = now.date()
             if in_rollover_window():
                 await asyncio.sleep(60); continue
+            # Fermer toutes positions ouvertes 1 min avant rollover
+            if now.hour == ROLLOVER_CLOSE_H and now.minute == ROLLOVER_CLOSE_M:
+                try:
+                    positions = await c.get_positions()
+                    if positions:
+                        log(f"ROLLOVER PRE-CLOSE: {len(positions)} position(s) ouverte(s), fermeture preventive")
+                        for pb in positions:
+                            ticket = int(pb.get('ticket', 0))
+                            if ticket:
+                                try:
+                                    await c._rpc('close', ticket=ticket)
+                                    log(f"ROLLOVER CLOSE ticket={ticket} OK")
+                                except Exception as e:
+                                    log(f"ROLLOVER CLOSE ticket={ticket} ERR: {e}")
+                except Exception as e:
+                    log(f"ROLLOVER PRE-CLOSE err: {e}")
             for sym in SETUPS_D1:
                 try:
                     await d1_try_breakout_pattern(c, sym, today, traded_today)
