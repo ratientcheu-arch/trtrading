@@ -86,7 +86,7 @@ SETUPS_D1 = [
 ]
 D1_WINDOW_M1 = 360  # 6h apres breakout pour chercher engulfing
 D1_HOLD_MIN = 60
-D1_SCAN_INTERVAL_SEC = 60   # scan toutes les 60s pour freshness 90s
+D1_SCAN_INTERVAL_SEC = 10   # scan toutes les 10s
 
 # === H4-Breakout switch 2026-05-07 21h ===
 H4_CAP_EUR = 3.0
