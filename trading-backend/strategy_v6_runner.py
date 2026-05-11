@@ -88,12 +88,12 @@ D1_WINDOW_M1 = 360  # 6h apres breakout pour chercher engulfing
 D1_HOLD_MIN = 60
 D1_SCAN_INTERVAL_SEC = 10   # scan toutes les 10s
 
-# === H4-Breakout switch 2026-05-07 21h ===
-H4_CAP_EUR = 3.0
-H4_TP_EUR_MIN = 7.0
-H4_RR = 3.0
-H4_WINDOW_M1 = 238  # 3h58 post-breakout (jusquau prochain H4)
-H4_COOLDOWN_H = 4    # 1 trade par H4-block
+# === H2-Breakout switch 2026-05-10 (ex H4, backtest H2 >> H4 sur jeu-ven) ===
+H2_CAP_EUR = 3.0
+H2_TP_EUR_MIN = 7.0
+H2_RR = 3.0
+H2_WINDOW_M1 = 118  # 1h58 post-breakout (jusquau prochain H2)
+H2_COOLDOWN_H = 2    # 1 trade par H2-block
 # Filtre heure par symbole : ne scan qu'apres l'ouverture liquide
 D1_START_HOUR = {
     'CAC40': 9, 'DAX40': 9,        # Euronext / Eurex
@@ -132,23 +132,46 @@ def d1_is_bear_engulf(prev, cur):
     return True
 
 async def d1_fetch_d1_prev(c, sym, today):
-    """H4-Breakout : recupere le dernier H4 completed (= reference range)."""
+    """H2-Breakout : synthetise la derniere H2 completed depuis 2 bougies H1.
+    Slots H2 broker (UTC+3) : 00,02,04,06,08,10,12,14,16,18,20,22.
+    Chaque H2 = fusion de 2 H1 consecutives (heure paire + heure impaire)."""
     now = datetime.now(PARIS)
-    # On veut le H4 qui vient de se terminer
     end_ts = int(now.timestamp())
-    start_ts = end_ts - 8*3600  # last 8 hours
+    start_ts = end_ts - 6*3600  # last 6 hours de H1
     try:
-        d = await c._rpc('bars', symbol=MT5_SYM[sym], timeframe='H4', from_ts=start_ts, to_ts=end_ts)
+        d = await c._rpc('bars', symbol=MT5_SYM[sym], timeframe='H1', from_ts=start_ts, to_ts=end_ts)
         items = d.get('items', [])
-        # Trouve le DERNIER H4 dont l'ouverture + 4h <= now (= H4 fully closed)
+        if len(items) < 2:
+            return None
+        # Construire les H2 depuis les paires H1
+        h2_candles = []
+        i = 0
+        while i < len(items):
+            t_open = datetime.fromtimestamp(int(items[i]['t']), tz=timezone.utc)
+            broker_h = (t_open.hour + 3) % 24  # UTC -> broker UTC+3
+            if broker_h % 2 == 0 and i + 1 < len(items):
+                # Debut slot H2 : fusionner avec la H1 suivante
+                a, b = items[i], items[i+1]
+                # Verifier que b suit bien a (ecart ~1h)
+                if int(b['t']) - int(a['t']) <= 3700:
+                    h2_open_dt = t_open.astimezone(PARIS)
+                    h2 = (h2_open_dt,
+                           float(a['o']),
+                           max(float(a['h']), float(b['h'])),
+                           min(float(a['l']), float(b['l'])),
+                           float(b['c']))
+                    h2_candles.append(h2)
+                    i += 2
+                    continue
+            i += 1
+        # Trouver la derniere H2 fully closed (open + 2h <= now)
         last_closed = None
-        for it in items:
-            t_open = datetime.fromtimestamp(int(it['t']), tz=timezone.utc).astimezone(PARIS)
-            if t_open + timedelta(hours=4) <= now:
-                last_closed = (t_open, float(it['o']), float(it['h']), float(it['l']), float(it['c']))
+        for h2 in h2_candles:
+            if h2[0] + timedelta(hours=2) <= now:
+                last_closed = h2
         return last_closed
     except Exception as e:
-        log(f"h4_fetch {sym} err: {e}")
+        log(f"h2_fetch {sym} err: {e}")
     return None
 
 async def d1_fetch_m15_today(c, sym, today, start_after=None):
@@ -196,98 +219,123 @@ async def d1_fetch_m5_current(c, sym):
     except: pass
     return None
 
-async def d1_try_breakout_pattern(c, sym, today, traded_today):
-    """Essaye de detecter un D1 breakout + M1 engulfing sur un symbole. Place ordre si valide."""
+async def d1_try_breakout_pattern(c, sym, today, traded_engulfings):
+    """H2-Breakout : detecte TOUTES les englobantes strictes apres breakout.
+    Ouvre un trade pour chaque englobante non encore tradee (anti-doublon par timestamp M1).
+    traded_engulfings = set de (sym, eng_timestamp) deja traites."""
     now_p = datetime.now(PARIS)
-    last_trade_t = traded_today.get(sym)
-    if last_trade_t and (now_p - last_trade_t).total_seconds() < 180:
-        return False
     if not d1_in_active_hours(sym):
         return False
     d1 = await d1_fetch_d1_prev(c, sym, today)
     if d1 is None: return False
     _, _, d1_high, d1_low, _ = d1
-    h4_ref_end = d1[0] + timedelta(hours=4)  # quand le H4 ref a clos
-    m15 = await d1_fetch_m15_today(c, sym, today, start_after=h4_ref_end)
+    h2_ref_end = d1[0] + timedelta(hours=2)  # quand le H2 ref a clos
+    m15 = await d1_fetch_m15_today(c, sym, today, start_after=h2_ref_end)
     if not m15: return False
-    # Trouve 1er breakout
+    # Trouve 1er breakout M15
     breakout_t = breakout_side = None
     for tt, o, h, l, cc in m15:
         if cc > d1_high: breakout_side = 'BUY'; breakout_t = tt; break
         if cc < d1_low: breakout_side = 'SELL'; breakout_t = tt; break
     if not breakout_side: return False
-    # M1 dans 3h post-breakout
-    m1_end = min(datetime.now(PARIS), breakout_t + timedelta(minutes=H4_WINDOW_M1))
+    # M1 dans 1h58 post-breakout (fenetre H2)
+    m1_end = min(datetime.now(PARIS), breakout_t + timedelta(minutes=H2_WINDOW_M1))
     m1 = await d1_fetch_m1_window(c, sym, breakout_t, m1_end)
     if len(m1) < 4: return False
-    # Cherche TOUTE englobante stricte (BULL ou BEAR) apres breakout
-    # Le breakout (HIGH ou LOW) declenche la fenetre de recherche uniquement
-    # C'est l'englobante qui determine la direction du trade
-    entry = sl = None
-    pattern = ''
-    trade_side = None
+    # Collecter englobantes strictes MODE B : sens du breakout uniquement
+    # BUY breakout -> only BUY engulfings, SELL breakout -> only SELL engulfings
+    engulfings = []
+    seen_ts = set()
     for i in range(1, len(m1)):
+        eng_ts = m1[i][0]  # datetime de la bougie englobante
+        eng_key = (sym, eng_ts)
+        if eng_key in traded_engulfings:
+            continue  # deja tradee ou rejetee
+        if eng_ts in seen_ts:
+            continue
+        eng_side = None
         if d1_is_bull_engulf(m1[i-1], m1[i]):
-            entry = m1[i-1][2]; sl = m1[i-1][3]; pattern = 'BULL_ENG'; trade_side = 'BUY'; break
-        if d1_is_bear_engulf(m1[i-1], m1[i]):
-            entry = m1[i-1][3]; sl = m1[i-1][2]; pattern = 'BEAR_ENG'; trade_side = 'SELL'; break
-    if entry is None: return False
-    # Filtre M5 en formation : doit confirmer la direction de l'englobante
-    m5_oc = await d1_fetch_m5_current(c, sym)
-    if m5_oc:
-        m5_o, m5_c = m5_oc
-        if trade_side == 'BUY' and m5_c < m5_o:
-            log(f"D1[{sym}] SKIP M5 rouge (engulf BUY mais M5 bear) o={m5_o} c={m5_c}")
-            traded_today[sym] = now_p
-            return False
-        if trade_side == 'SELL' and m5_c > m5_o:
-            log(f"D1[{sym}] SKIP M5 verte (engulf SELL mais M5 bull) o={m5_o} c={m5_c}")
-            traded_today[sym] = now_p
-            return False
-    sl_d = abs(entry - sl)
-    if sl_d <= 0: return False
-    tp_d = sl_d * H4_RR  # H4-Breakout R:R 3.0
-    lot, status = compute_lot(sym, sl_d, tp_d, tp_min=H4_TP_EUR_MIN)
-    if lot is None:
-        log(f"D1[{sym}] {trade_side}: rejet sizing {status}")
-        return False
-    pattern_t = m1[i][0]
-    age_min = (datetime.now(PARIS) - pattern_t).total_seconds() / 60
-    if age_min > 1.5:
-        log(f"D1[{sym}] PATTERN {pattern} M1@{pattern_t.strftime('%H:%M')} TROP VIEUX ({age_min:.1f}min, max 1.5min) skip")
-        traded_today[sym] = now_p
-        return False
-    log(f"D1[{sym}] *** PATTERN {pattern} {trade_side} brk={breakout_side} M1@{pattern_t.strftime('%H:%M')} (frais {age_min:.0f}min) entry={entry} SL={sl} sl_d={sl_d:.5f} ***")
-    # FIX 2026-05-07 : verif divergence prix marché vs calc entry. Si > 1× sl_d -> abort
-    try:
-        q_check = await c._rpc('quote', symbol=MT5_SYM[sym])
-        cur_check = float(q_check.get('ask') if trade_side == 'BUY' else q_check.get('bid'))
-        divergence = abs(cur_check - entry)
-        max_div = sl_d * 1.0  # tolerance 100% du sl_d
-        if divergence > max_div:
-            log(f"D1[{sym}] ABORT : prix marche {cur_check} diverge {divergence:.5f} (max {max_div:.5f}) vs entry calc {entry}")
-            traded_today[sym] = now_p
-            return False
-    except Exception as e:
-        log(f"D1[{sym}] divergence check err: {e}")
-    p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=D1_HOLD_MIN)
-    if p:
-        log(f"D1[{sym}] *** POSITION D1-BREAKOUT {trade_side} (brk={breakout_side}) #{p.ticket} ***")
-        await db_insert_position(p)
-        asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], D1_HOLD_MIN))
-        traded_today[sym] = now_p
-        return True
-    return False
+            eng_side = 'BUY'
+        elif d1_is_bear_engulf(m1[i-1], m1[i]):
+            eng_side = 'SELL'
+        if eng_side is None:
+            continue
+        # MODE B : filtrer par sens du breakout
+        if breakout_side == 'BUY' and eng_side != 'BUY':
+            continue
+        if breakout_side == 'SELL' and eng_side != 'SELL':
+            continue
+        seen_ts.add(eng_ts)
+        pattern = 'BULL_ENG' if eng_side == 'BUY' else 'BEAR_ENG'
+        engulfings.append((i, pattern, eng_side, eng_ts))
+    if not engulfings: return False
+    # Calcul SL/TP Fibo base sur le range H2 (pas M1 !)
+    h2_high, h2_low, h2_close = d1[2], d1[3], d1[4]
+    opened = False
+    for i, pattern, trade_side, eng_ts in engulfings:
+        eng_key = (sym, eng_ts)
+        # Fraicheur : on ne trade que si l'englobante a < 1.5 min
+        age_min = (datetime.now(PARIS) - eng_ts).total_seconds() / 60
+        if age_min > 1.5:
+            traded_engulfings.add(eng_key)  # marquer comme vue (trop vieille)
+            continue
+        # Filtre M5 en formation : doit confirmer la direction de l'englobante
+        m5_oc = await d1_fetch_m5_current(c, sym)
+        if m5_oc:
+            m5_o, m5_c = m5_oc
+            if trade_side == 'BUY' and m5_c < m5_o:
+                log(f"D1[{sym}] SKIP M5 rouge (engulf BUY mais M5 bear) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
+                traded_engulfings.add(eng_key)
+                continue
+            if trade_side == 'SELL' and m5_c > m5_o:
+                log(f"D1[{sym}] SKIP M5 verte (engulf SELL mais M5 bull) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
+                traded_engulfings.add(eng_key)
+                continue
+        # SL/TP Fibo best-of base sur range H2 (R:R min 2.0, max ~4.0)
+        tp_d, sl_d = compute_tp_sl(trade_side, h2_high, h2_low, h2_close)
+        if sl_d <= 0 or tp_d <= 0:
+            traded_engulfings.add(eng_key); continue
+        lot, status = compute_lot(sym, sl_d, tp_d, tp_min=H2_TP_EUR_MIN)
+        if lot is None:
+            log(f"D1[{sym}] {trade_side}: rejet sizing {status} eng@{eng_ts.strftime('%H:%M')} sl_d={sl_d:.5f} tp_d={tp_d:.5f}")
+            traded_engulfings.add(eng_key); continue
+        rr = tp_d / sl_d if sl_d > 0 else 0
+        log(f"D1[{sym}] *** PATTERN {pattern} {trade_side} brk={breakout_side} M1@{eng_ts.strftime('%H:%M')} (frais {age_min:.0f}min) Fibo H2: sl_d={sl_d:.5f} tp_d={tp_d:.5f} R:R={rr:.2f} ***")
+        # Verif divergence prix marche vs entry attendu (close M1 englobante)
+        try:
+            q_check = await c._rpc('quote', symbol=MT5_SYM[sym])
+            cur_check = float(q_check.get('ask') if trade_side == 'BUY' else q_check.get('bid'))
+            entry_est = m1[i][4]  # close de la bougie englobante
+            divergence = abs(cur_check - entry_est)
+            max_div = sl_d * 0.5  # max 50% du SL de divergence
+            if divergence > max_div:
+                log(f"D1[{sym}] ABORT : prix marche {cur_check} diverge {divergence:.5f} vs entry {entry_est} (max {max_div:.5f}) eng@{eng_ts.strftime('%H:%M')}")
+                traded_engulfings.add(eng_key); continue
+        except Exception as e:
+            log(f"D1[{sym}] divergence check err: {e}")
+        p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=D1_HOLD_MIN)
+        if p:
+            log(f"D1[{sym}] *** POSITION H2-BREAKOUT {trade_side} (brk={breakout_side}) #{p.ticket} Fibo R:R={rr:.2f} eng@{eng_ts.strftime('%H:%M')} ***")
+            await db_insert_position(p)
+            asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], D1_HOLD_MIN))
+            opened = True
+        traded_engulfings.add(eng_key)
+    return opened
 
 async def d1_breakout_scanner(c):
-    """Scanner D1-Breakout V3 BASE : tourne en continu sur les 12 symboles keepers."""
-    log(f"D1-Breakout scanner ON - {len(SETUPS_D1)} symboles - scan every {D1_SCAN_INTERVAL_SEC}s")
-    traded_today = {}  # (date, sym) -> True
+    """Scanner H2-Breakout : tourne en continu sur les 12 symboles keepers.
+    Prend TOUTES les englobantes strictes apres breakout (multi-trade par creneau H2).
+    Anti-doublon par set de (sym, eng_timestamp)."""
+    log(f"H2-Breakout scanner ON - {len(SETUPS_D1)} symboles - scan every {D1_SCAN_INTERVAL_SEC}s")
+    traded_engulfings = set()  # set de (sym, eng_datetime) deja traites
+    scan_count = 0
     while True:
         try:
             now = datetime.now(PARIS)
-            now_p = now
             today = now.date()
+            scan_count += 1
+            if scan_count % 30 == 1:  # log every ~5min (30 x 10s)
+                log(f"H2-scan #{scan_count} alive @{now.strftime('%H:%M')} traded_eng={len(traded_engulfings)}")
             if in_rollover_window():
                 await asyncio.sleep(60); continue
             # Fermer toutes positions ouvertes 1 min avant rollover
@@ -308,12 +356,17 @@ async def d1_breakout_scanner(c):
                     log(f"ROLLOVER PRE-CLOSE err: {e}")
             for sym in SETUPS_D1:
                 try:
-                    await d1_try_breakout_pattern(c, sym, today, traded_today)
+                    await asyncio.wait_for(
+                        d1_try_breakout_pattern(c, sym, today, traded_engulfings),
+                        timeout=30.0  # max 30s par symbole, evite hang RPC
+                    )
+                except asyncio.TimeoutError:
+                    log(f"D1[{sym}] TIMEOUT 30s - skip")
                 except Exception as e:
                     log(f"D1[{sym}] try err: {e}")
-            # Cleanup ancien (>2j)
-            cutoff_t = now - timedelta(hours=8)
-            traded_today = {k: v for k, v in traded_today.items() if v >= cutoff_t}
+            # Cleanup ancien (>4h) pour eviter que le set grossisse indefiniment
+            cutoff = now - timedelta(hours=4)
+            traded_engulfings = {k for k in traded_engulfings if k[1] >= cutoff}
         except Exception as e:
             log(f"d1_breakout_scanner top err: {e}")
         await asyncio.sleep(D1_SCAN_INTERVAL_SEC)
@@ -430,18 +483,21 @@ class Pos:
     exit_at: Optional[datetime] = None
 
 def update_trail_sl(p, fav_pct):
-    """Calcule le nouveau SL selon le mode trail."""
+    """Calcule le nouveau SL selon le mode trail.
+    A_15 (H2-Breakout) :
+      Phase 1 (30-44%) : SL = fav - 30% → BE a 30%, 5% a 35%, 10% a 40%
+      Phase 2 (45%+)   : SL = fav - 10% → 35% a 45%, 40% a 50%, etc.
+    """
     sign = 1 if p.dr == 'BUY' else -1
     if p.trail_mode == 'A_15':
-        # Phase 2 : paliers de 10% a partir de 50% TP
-        if fav_pct >= 0.90: return p.entry + sign * 0.80 * p.tp_d, True
-        if fav_pct >= 0.80: return p.entry + sign * 0.70 * p.tp_d, True
-        if fav_pct >= 0.70: return p.entry + sign * 0.60 * p.tp_d, True
-        if fav_pct >= 0.60: return p.entry + sign * 0.50 * p.tp_d, True
-        if fav_pct >= 0.50: return p.entry + sign * 0.40 * p.tp_d, True
-        # Phase 1 : continu de 30% a 50%, SL trail 30% behind (commence + tard)
-        if fav_pct >= 0.30:
-            return p.entry + sign * (fav_pct - 0.30) * p.tp_d, True
+        if fav_pct >= 0.45:
+            # Phase 2 : trail 10% derriere, verrouille les gains
+            lock = fav_pct - 0.10
+            return p.entry + sign * lock * p.tp_d, True
+        if fav_pct >= 0.25:
+            # Phase 1 : trail 25% derriere (BE a 25%, 5% a 30%, 10% a 35%, 20% a 45%)
+            lock = fav_pct - 0.25
+            return p.entry + sign * lock * p.tp_d, True
     elif p.trail_mode == 'A_30':
         if fav_pct >= 0.30:
             return p.entry + sign * (fav_pct - 0.30) * p.tp_d, True
@@ -706,18 +762,11 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
                     continue
             elif adv_pct < 0.50:
                 p.sustain_start = None  # reset uniquement si retour < 50%
-            # Trail FIX BUG #5 : digits dynamique
-            new_sl, do_trail = update_trail_sl(p, fav_pct)
-            if do_trail and new_sl is not None:
-                if (p.dr == 'BUY' and new_sl > p.sl) or (p.dr == 'SELL' and new_sl < p.sl):
-                    new_sl_r = round(new_sl, digits)
-                    try:
-                        await c._rpc('modify_sltp', ticket=p.ticket, sl=new_sl_r, tp=p.tp)
-                        log(f"#{p.pos_id} {p.sym} TRAIL SL {p.sl} -> {new_sl_r} (fav={fav_pct:.1%})")
-                        p.sl = new_sl_r; p.trail_active = True
-                    except Exception as e:
-                        if 'no changes' not in str(e).lower():
-                            log(f"trail err: {e}")
+            # Trail DESACTIVE ici — gere UNIQUEMENT par manage_all_loop (fix conflit dual-trail 2026-05-11)
+            # Avant: manage_position ET manage_all_loop modifiaient le SL en parallele avec des
+            # calculs differents, causant le SL a redescendre apres avoir ete monte (ex: DAX40 -2.18€
+            # au lieu de gain verrouille). Seul manage_all_loop tourne maintenant (toutes les 8s).
+            pass
         except Exception as e:
             log(f"manage err: {e}\n{traceback.format_exc()[:300]}")
     if p.status == 'OPEN':
@@ -1180,33 +1229,28 @@ async def manage_all_loop(c):
                 elif adv_pct < 0.50:
                     SUSTAIN_TRACK.pop(ticket, None)
 
-                # Trail dynamique : si TRAIL_CONFIG[ticket] specifie, utilise mode custom
-                # Sinon : 15% par defaut, 30% si paire calme (range etroit)
+                # Trail dynamique : A_15 par defaut
+                # Phase 1 (30-44%) : SL = fav - 30% (BE a 30%, 5% a 35%, 10% a 40%)
+                # Phase 2 (45%+)   : SL = fav - 10% (35% a 45%, 40% a 50%, etc.)
                 cfg = TRAIL_CONFIG.get(ticket)
                 if cfg:
                     mode = cfg.get('mode', 'A_15')
-                    trail_start = cfg.get('start_pct', 0.15)
                 else:
-                    mode = 'A_15'  # default formula = lineaire 1:1
-                    if 'JPY' in sym:
-                        trail_start = 0.30 if tp_d < 0.15 else 0.15
-                    elif sym in ('GER40','NAS100','US30','FRA40','JPN225','HK50','CAC40','DAX40','NKY'):
-                        trail_start = 0.30 if tp_d < 30 else 0.15
-                    elif sym in ('XAUUSD',):
-                        trail_start = 0.30 if tp_d < 5 else 0.15
-                    elif sym in ('XTIUSD',):
-                        trail_start = 0.30 if tp_d < 0.50 else 0.15
-                    else:
-                        trail_start = 0.30 if tp_d < 0.0010 else 0.15
+                    mode = 'A_15'
                 # Calcul new_sl selon mode
                 new_sl = None
                 if mode == 'A_15' or mode == 'A_30':
-                    if fav_pct >= trail_start:
-                        lock_pct = fav_pct - trail_start
+                    if fav_pct >= 0.45:
+                        # Phase 2 : trail 10% derriere
+                        lock_pct = fav_pct - 0.10
+                        new_sl = entry + sign * lock_pct * tp_d
+                    elif fav_pct >= 0.25:
+                        # Phase 1 : trail 25% derriere (BE a 25%)
+                        lock_pct = fav_pct - 0.25
                         new_sl = entry + sign * lock_pct * tp_d
                 elif mode == 'B_slow':
-                    if fav_pct >= trail_start:
-                        lock_pct = (fav_pct - trail_start) / 3.0
+                    if fav_pct >= 0.30:
+                        lock_pct = (fav_pct - 0.30) / 3.0
                         new_sl = entry + sign * lock_pct * tp_d
                 elif mode == 'D_palier':
                     if fav_pct >= 0.80: new_sl = entry + sign * 0.65 * tp_d
