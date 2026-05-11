@@ -39,6 +39,8 @@ interface LivePosition {
   broker: string;
   asset_type?: string;
   pnl_conv_rate?: number;
+  sl_pnl_eur?: number;
+  tp_pnl_eur?: number;
 }
 
 interface ClosedTrade {
@@ -335,26 +337,42 @@ function SignauxProches({ signals }: { signals: { symbol: string; name: string; 
   );
 }
 
+/** Convertit lots MT5 → unites pour calcul P&L */
+const DASH_CONTRACTS: Record<string, number> = {
+  'NAS100': 1, 'US30': 1, 'GER40': 1, 'FRA40': 1, 'JPN225': 0.063,
+  'HK50': 1, 'XAUUSD': 100, 'XTIUSD': 1000,
+};
+const DASH_FX = ['EUR','USD','GBP','JPY','CHF','AUD','NZD','CAD'];
+function dashLotsToUnits(sym: string, lots: number): number {
+  if (DASH_CONTRACTS[sym] !== undefined) return lots * DASH_CONTRACTS[sym];
+  const s = sym.replace('/','');
+  if (s.length === 6 && DASH_FX.includes(s.slice(0,3)) && DASH_FX.includes(s.slice(3,6)))
+    return lots * 100_000;
+  return lots;
+}
+
 /** Calcul du P&L potentiel si le TP est touché */
 function calcPotentialTpPnl(pos: LivePosition): number {
+  if (typeof pos.tp_pnl_eur === 'number') return pos.tp_pnl_eur;
   if (!pos.take_profit || !pos.entry_price) return 0;
   const isLong = pos.action === 'BUY';
   const diff = isLong
     ? pos.take_profit - pos.entry_price
     : pos.entry_price - pos.take_profit;
   const conv = pos.pnl_conv_rate ?? 0.87;
-  return diff * pos.quantity * conv;
+  return diff * dashLotsToUnits(pos.symbol, pos.quantity) * conv;
 }
 
 /** Calcul du P&L potentiel si le SL est touché */
 function calcPotentialSlPnl(pos: LivePosition): number {
+  if (typeof pos.sl_pnl_eur === 'number') return pos.sl_pnl_eur;
   if (!pos.stop_loss || !pos.entry_price) return 0;
   const isLong = pos.action === 'BUY';
   const diff = isLong
     ? pos.stop_loss - pos.entry_price
     : pos.entry_price - pos.stop_loss;
   const conv = pos.pnl_conv_rate ?? 0.87;
-  return diff * pos.quantity * conv;
+  return diff * dashLotsToUnits(pos.symbol, pos.quantity) * conv;
 }
 
 // ── Helpers for position display ──────────────────────────────────────

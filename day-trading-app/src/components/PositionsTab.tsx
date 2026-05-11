@@ -19,6 +19,21 @@ interface LivePos {
   sl_pnl_eur?: number; tp_pnl_eur?: number;
 }
 
+/** Convertit lots MT5 → unites pour calcul P&L.
+ *  Forex = 100_000 unites/lot, indices/commo = contract size */
+const CONTRACTS: Record<string, number> = {
+  'NAS100': 1, 'US30': 1, 'GER40': 1, 'FRA40': 1, 'JPN225': 0.063,
+  'HK50': 1, 'XAUUSD': 100, 'XTIUSD': 1000,
+};
+const FX_CCYS = ['EUR','USD','GBP','JPY','CHF','AUD','NZD','CAD'];
+function lotsToUnits(sym: string, lots: number): number {
+  if (CONTRACTS[sym] !== undefined) return lots * CONTRACTS[sym];
+  const s = sym.replace('/','');
+  if (s.length === 6 && FX_CCYS.includes(s.slice(0,3)) && FX_CCYS.includes(s.slice(3,6)))
+    return lots * 100_000;
+  return lots; // fallback
+}
+
 interface ClosedTrade {
   symbol: string; action: string; entry_price: number; exit_price: number;
   quantity: number; pnl: number; commission?: number;
@@ -220,7 +235,7 @@ export default function PositionsTab() {
       const isBuy = p.action === 'BUY';
       const tpDist = isBuy ? p.take_profit - p.entry_price : p.entry_price - p.take_profit;
       const conv = p.pnl_conv_rate ?? 0.87;
-      return s + tpDist * p.quantity * conv;
+      return s + tpDist * lotsToUnits(p.symbol, p.quantity) * conv;
     }
     return s;
   }, 0);
@@ -363,8 +378,9 @@ export default function PositionsTab() {
                   const slDist = isBuy ? sl - p.entry_price : p.entry_price - sl;
                   const tpDist = isBuy ? tp - p.entry_price : p.entry_price - tp;
                   const conv = p.pnl_conv_rate ?? 0.87;
-                  slPnl = slDist * p.quantity * conv;
-                  tpPnl = tpDist * p.quantity * conv;
+                  const units = lotsToUnits(p.symbol, p.quantity);
+                  slPnl = slDist * units * conv;
+                  tpPnl = tpDist * units * conv;
                 }
               }
 
