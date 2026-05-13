@@ -17,6 +17,8 @@ interface LivePos {
   ticket?: number; market_category?: string;
   asset_type?: string; pnl_conv_rate?: number;
   sl_pnl_eur?: number; tp_pnl_eur?: number;
+  risk_eur?: number; reward_eur?: number;
+  sl_dist?: number; tp_dist?: number;
 }
 
 /** Convertit lots MT5 → unites pour calcul P&L.

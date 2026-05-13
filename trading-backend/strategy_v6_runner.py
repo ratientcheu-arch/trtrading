@@ -83,21 +83,22 @@ SETUPS_ORB = []  # DESACTIVE 2026-05-07 - remplace par D1-Breakout V3
 SETUPS_D1 = [
     'EUR/USD','GBP/USD','USD/JPY','GBP/JPY','AUD/USD','EUR/JPY',
     'USD/CHF','USD/CAD','NASDAQ','US30','GOLD','DAX40',
+    'US500','UK100','CAC40',
 ]
 D1_WINDOW_M1 = 360  # 6h apres breakout pour chercher engulfing
-D1_HOLD_MIN = 60
+D1_HOLD_MIN = 30   # 2026-05-11 : reduit de 60 a 30min
 D1_SCAN_INTERVAL_SEC = 10   # scan toutes les 10s
 
 # === H2-Breakout switch 2026-05-10 (ex H4, backtest H2 >> H4 sur jeu-ven) ===
 H2_CAP_EUR = 3.0
-H2_TP_EUR_MIN = 7.0
+H2_TP_EUR_MIN = 5.0   # 2026-05-12 : reduit de 7 a 5€ pour debloquer GOLD, AUDUD, USDCHF, USDCAD
 H2_RR = 3.0
 H2_WINDOW_M1 = 118  # 1h58 post-breakout (jusquau prochain H2)
 H2_COOLDOWN_H = 2    # 1 trade par H2-block
 # Filtre heure par symbole : ne scan qu'apres l'ouverture liquide
 D1_START_HOUR = {
-    'CAC40': 9, 'DAX40': 9,        # Euronext / Eurex
-    'NASDAQ': 15, 'US30': 15,      # NY cash open 15:30
+    'CAC40': 9, 'DAX40': 9, 'UK100': 9,  # Euronext / Eurex / LSE
+    'NASDAQ': 15, 'US30': 15, 'US500': 15,  # NY cash open 15:30
     'GOLD': 1,                      # commod 24h mais tres calme tot matin
     # forex et autres : pas de filtre (24h)
 }
@@ -175,7 +176,9 @@ async def d1_fetch_d1_prev(c, sym, today):
     return None
 
 async def d1_fetch_m15_today(c, sym, today, start_after=None):
-    """Recupere les M15 depuis start_after (ou debut today)."""
+    """Recupere les M15 depuis start_after (ou debut today).
+    Fix 2026-05-12 : SUPPRIME le filtre tt.date()==today qui cassait les breakouts overnight
+    (H2 ref de la veille → M15 post-breakout aussi de la veille → filtrees a tort)."""
     if start_after is None:
         start_ts = int(datetime.combine(today, dtime(0,0), tzinfo=PARIS).timestamp())
     else:
@@ -186,8 +189,8 @@ async def d1_fetch_m15_today(c, sym, today, start_after=None):
         out = []
         for it in d.get('items', []):
             tt = datetime.fromtimestamp(int(it['t']), tz=timezone.utc).astimezone(PARIS)
-            if tt.date() == today:
-                out.append((tt, float(it['o']), float(it['h']), float(it['l']), float(it['c'])))
+            # Plus de filtre par date — start_after suffit a borner la fenetre
+            out.append((tt, float(it['o']), float(it['h']), float(it['l']), float(it['c'])))
         return sorted(out)
     except Exception as e:
         log(f"d1_fetch_m15_today {sym} err: {e}"); return []
@@ -219,17 +222,51 @@ async def d1_fetch_m5_current(c, sym):
     except: pass
     return None
 
-async def d1_try_breakout_pattern(c, sym, today, traded_engulfings):
-    """H2-Breakout : detecte TOUTES les englobantes strictes apres breakout.
-    Ouvre un trade pour chaque englobante non encore tradee (anti-doublon par timestamp M1).
-    traded_engulfings = set de (sym, eng_timestamp) deja traites."""
+async def d1_fetch_m5_at(c, sym, eng_ts):
+    """Recupere la M5 CLOTUREE qui CONTIENT l'englobante.
+    Backtest prouve +910€ vs +136€ sur 22 jours — ce filtre est 7x plus rentable.
+    Englobante a 18:10 → M5 = 18:10-18:15 → WAIT si pas encore close.
+    Englobante a 18:12 → M5 = 18:10-18:15 → WAIT si pas encore close.
+    Retourne (o,c) si close, 'WAIT' si en formation, None si erreur."""
+    import time as _time
+    try:
+        eng_epoch = int(eng_ts.timestamp())
+        now_epoch = int(_time.time())
+        # M5 qui contient l'englobante : slot aligne sur 5 min
+        m5_slot_open = eng_epoch - (eng_epoch % 300)
+        m5_slot_close = m5_slot_open + 300
+        # Si la M5 n'est pas encore cloturee → on attend
+        if now_epoch < m5_slot_close:
+            return 'WAIT'
+        # M5 cloturee — la recuperer
+        d = await c._rpc('bars', symbol=MT5_SYM[sym], timeframe='M5',
+                         from_ts=m5_slot_open - 60, to_ts=m5_slot_close + 60)
+        items = d.get('items', [])
+        if items:
+            for it in items:
+                if abs(int(it['t']) - m5_slot_open) < 60:
+                    return (float(it.get('o', 0)), float(it.get('c', 0)))
+            last = items[-1]
+            return (float(last.get('o', 0)), float(last.get('c', 0)))
+    except Exception as e:
+        log(f"d1_fetch_m5_at {sym} err: {e}")
+    return None
+
+async def d1_try_breakout_pattern(c, sym, today, traded_symbols_h2):
+    """H2-Breakout : detecte la 1ERE englobante stricte apres breakout.
+    1 SEUL trade par symbole par creneau H2 (comme le backtest valide multi_eng=False).
+    traded_symbols_h2 = dict {sym: h2_open_time} → bloque le symbole pour ce H2-block."""
     now_p = datetime.now(PARIS)
     if not d1_in_active_hours(sym):
         return False
     d1 = await d1_fetch_d1_prev(c, sym, today)
     if d1 is None: return False
+    h2_open_t = d1[0]  # datetime d'ouverture du H2 ref
+    # Si deja trade sur ce symbole pour ce H2-block → skip
+    if sym in traded_symbols_h2 and traded_symbols_h2[sym] == h2_open_t:
+        return False
     _, _, d1_high, d1_low, _ = d1
-    h2_ref_end = d1[0] + timedelta(hours=2)  # quand le H2 ref a clos
+    h2_ref_end = h2_open_t + timedelta(hours=2)  # quand le H2 ref a clos
     m15 = await d1_fetch_m15_today(c, sym, today, start_after=h2_ref_end)
     if not m15: return False
     # Trouve 1er breakout M15
@@ -242,17 +279,9 @@ async def d1_try_breakout_pattern(c, sym, today, traded_engulfings):
     m1_end = min(datetime.now(PARIS), breakout_t + timedelta(minutes=H2_WINDOW_M1))
     m1 = await d1_fetch_m1_window(c, sym, breakout_t, m1_end)
     if len(m1) < 4: return False
-    # Collecter englobantes strictes MODE B : sens du breakout uniquement
-    # BUY breakout -> only BUY engulfings, SELL breakout -> only SELL engulfings
-    engulfings = []
-    seen_ts = set()
+    # Cherche la 1ERE englobante stricte MODE B (sens du breakout uniquement)
+    first_eng = None
     for i in range(1, len(m1)):
-        eng_ts = m1[i][0]  # datetime de la bougie englobante
-        eng_key = (sym, eng_ts)
-        if eng_key in traded_engulfings:
-            continue  # deja tradee ou rejetee
-        if eng_ts in seen_ts:
-            continue
         eng_side = None
         if d1_is_bull_engulf(m1[i-1], m1[i]):
             eng_side = 'BUY'
@@ -265,69 +294,102 @@ async def d1_try_breakout_pattern(c, sym, today, traded_engulfings):
             continue
         if breakout_side == 'SELL' and eng_side != 'SELL':
             continue
-        seen_ts.add(eng_ts)
         pattern = 'BULL_ENG' if eng_side == 'BUY' else 'BEAR_ENG'
-        engulfings.append((i, pattern, eng_side, eng_ts))
-    if not engulfings: return False
-    # Calcul SL/TP Fibo base sur le range H2 (pas M1 !)
-    h2_high, h2_low, h2_close = d1[2], d1[3], d1[4]
-    opened = False
-    for i, pattern, trade_side, eng_ts in engulfings:
-        eng_key = (sym, eng_ts)
-        # Fraicheur : on ne trade que si l'englobante a < 1.5 min
-        age_min = (datetime.now(PARIS) - eng_ts).total_seconds() / 60
-        if age_min > 1.5:
-            traded_engulfings.add(eng_key)  # marquer comme vue (trop vieille)
-            continue
-        # Filtre M5 en formation : doit confirmer la direction de l'englobante
-        m5_oc = await d1_fetch_m5_current(c, sym)
-        if m5_oc:
-            m5_o, m5_c = m5_oc
-            if trade_side == 'BUY' and m5_c < m5_o:
-                log(f"D1[{sym}] SKIP M5 rouge (engulf BUY mais M5 bear) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
-                traded_engulfings.add(eng_key)
-                continue
-            if trade_side == 'SELL' and m5_c > m5_o:
-                log(f"D1[{sym}] SKIP M5 verte (engulf SELL mais M5 bull) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
-                traded_engulfings.add(eng_key)
-                continue
-        # SL/TP Fibo best-of base sur range H2 (R:R min 2.0, max ~4.0)
-        tp_d, sl_d = compute_tp_sl(trade_side, h2_high, h2_low, h2_close)
-        if sl_d <= 0 or tp_d <= 0:
-            traded_engulfings.add(eng_key); continue
-        lot, status = compute_lot(sym, sl_d, tp_d, tp_min=H2_TP_EUR_MIN)
-        if lot is None:
-            log(f"D1[{sym}] {trade_side}: rejet sizing {status} eng@{eng_ts.strftime('%H:%M')} sl_d={sl_d:.5f} tp_d={tp_d:.5f}")
-            traded_engulfings.add(eng_key); continue
-        rr = tp_d / sl_d if sl_d > 0 else 0
-        log(f"D1[{sym}] *** PATTERN {pattern} {trade_side} brk={breakout_side} M1@{eng_ts.strftime('%H:%M')} (frais {age_min:.0f}min) Fibo H2: sl_d={sl_d:.5f} tp_d={tp_d:.5f} R:R={rr:.2f} ***")
-        # Verif divergence prix marche vs entry attendu (close M1 englobante)
-        try:
-            q_check = await c._rpc('quote', symbol=MT5_SYM[sym])
-            cur_check = float(q_check.get('ask') if trade_side == 'BUY' else q_check.get('bid'))
-            entry_est = m1[i][4]  # close de la bougie englobante
-            divergence = abs(cur_check - entry_est)
-            max_div = sl_d * 0.5  # max 50% du SL de divergence
-            if divergence > max_div:
-                log(f"D1[{sym}] ABORT : prix marche {cur_check} diverge {divergence:.5f} vs entry {entry_est} (max {max_div:.5f}) eng@{eng_ts.strftime('%H:%M')}")
-                traded_engulfings.add(eng_key); continue
-        except Exception as e:
-            log(f"D1[{sym}] divergence check err: {e}")
-        p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=D1_HOLD_MIN)
-        if p:
-            log(f"D1[{sym}] *** POSITION H2-BREAKOUT {trade_side} (brk={breakout_side}) #{p.ticket} Fibo R:R={rr:.2f} eng@{eng_ts.strftime('%H:%M')} ***")
-            await db_insert_position(p)
-            asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], D1_HOLD_MIN))
-            opened = True
-        traded_engulfings.add(eng_key)
-    return opened
+        first_eng = (i, pattern, eng_side, m1[i][0])
+        break  # 1ERE SEULE — comme le backtest valide
+    if first_eng is None: return False
+    i, pattern, trade_side, eng_ts = first_eng
+    age_min = (now_p - eng_ts).total_seconds() / 60
+    # === LOGGING AUDIT — tracer chaque decision ===
+    log(f"D1[{sym}] AUDIT: H2ref={h2_open_t.strftime('%H:%M')} H={d1_high:.5f} L={d1_low:.5f} | brk={breakout_side}@{breakout_t.strftime('%H:%M')} | eng={pattern} {trade_side}@{eng_ts.strftime('%H:%M')} age={age_min:.1f}min")
+    # Filtre M5 : M5 CLOTUREE qui CONTIENT l'englobante (backtest: +910€ vs +136€)
+    # eng@18:10 → M5 18:10-18:15 → WAIT si pas close, entree des que close
+    m5_oc = await d1_fetch_m5_at(c, sym, eng_ts)
+    if m5_oc == 'WAIT':
+        # Pendant le WAIT on ne check PAS la fraicheur — le WAIT est inherent au systeme
+        # On abandonne seulement si l'englobante a plus de 8 min (securite anti-boucle)
+        if age_min > 8.0:
+            log(f"D1[{sym}] TIMEOUT WAIT M5 eng@{eng_ts.strftime('%H:%M')} age={age_min:.1f}min > 8min")
+            traded_symbols_h2[sym] = h2_open_t
+            return False
+        log(f"D1[{sym}] WAIT M5 cloture eng@{eng_ts.strftime('%H:%M')} (M5 en formation, retry 10s)")
+        return False  # PAS de mark traded → reitere au prochain scan
+    # M5 close — fraicheur max 1 min apres cloture M5 pour entrer
+    import time as _t
+    eng_epoch = int(eng_ts.timestamp())
+    m5_close_epoch = eng_epoch - (eng_epoch % 300) + 300
+    sec_since_m5_close = _t.time() - m5_close_epoch
+    if sec_since_m5_close > 60:
+        log(f"D1[{sym}] EXPIRE: M5 close il y a {sec_since_m5_close:.0f}s > 60s, trop tard")
+        traded_symbols_h2[sym] = h2_open_t
+        return False
+    if not m5_oc:
+        log(f"D1[{sym}] SKIP: pas de M5 data @eng eng@{eng_ts.strftime('%H:%M')}")
+        traded_symbols_h2[sym] = h2_open_t
+        return False
+    m5_o, m5_c = m5_oc
+    if trade_side == 'BUY' and m5_c < m5_o:
+        log(f"D1[{sym}] SKIP M5 rouge @eng (engulf BUY mais M5 bear) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
+        traded_symbols_h2[sym] = h2_open_t
+        return False
+    if trade_side == 'SELL' and m5_c > m5_o:
+        log(f"D1[{sym}] SKIP M5 verte @eng (engulf SELL mais M5 bull) o={m5_o} c={m5_c} eng@{eng_ts.strftime('%H:%M')}")
+        traded_symbols_h2[sym] = h2_open_t
+        return False
+    m5_color = 'VERTE' if m5_c > m5_o else 'ROUGE' if m5_c < m5_o else 'DOJI'
+    log(f"D1[{sym}] M5 OK: {m5_color} o={m5_o:.5f} c={m5_c:.5f} (trade {trade_side})")
+    # SL/TP : SL = low 1ere bougie - 1/3 range H2, TP = high 2eme bougie + 2/3 range H2
+    h2_high, h2_low = d1[2], d1[3]
+    h2_range = h2_high - h2_low
+    prev_low = m1[i-1][3]    # low 1ere bougie (rouge pour BUY)
+    prev_high = m1[i-1][2]   # high 1ere bougie (verte pour SELL)
+    eng_close = m1[i][4]     # close 2eme bougie ≈ entry
+    eng_high = m1[i][2]      # high 2eme bougie
+    eng_low = m1[i][3]       # low 2eme bougie
+    tp_d, sl_d = compute_tp_sl_engulfing(trade_side, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low)
+    if sl_d <= 0 or tp_d <= 0:
+        traded_symbols_h2[sym] = h2_open_t; return False
+    lot, status = compute_lot(sym, sl_d, tp_d, tp_min=H2_TP_EUR_MIN)
+    if lot is None:
+        log(f"D1[{sym}] {trade_side}: rejet sizing {status} eng@{eng_ts.strftime('%H:%M')} sl_d={sl_d:.5f} tp_d={tp_d:.5f}")
+        traded_symbols_h2[sym] = h2_open_t; return False
+    rr = tp_d / sl_d if sl_d > 0 else 0
+    log(f"D1[{sym}] *** PATTERN {pattern} {trade_side} brk={breakout_side} M1@{eng_ts.strftime('%H:%M')} (frais {age_min:.0f}min) H2r={h2_range:.5f} prevL={prev_low:.5f} prevH={prev_high:.5f} engH={eng_high:.5f} engL={eng_low:.5f} sl_d={sl_d:.5f} tp_d={tp_d:.5f} R:R={rr:.2f} ***")
+    # Verif divergence prix marche vs entry attendu
+    try:
+        q_check = await c._rpc('quote', symbol=MT5_SYM[sym])
+        cur_check = float(q_check.get('ask') if trade_side == 'BUY' else q_check.get('bid'))
+        entry_est = m1[i][4]  # close de la bougie englobante
+        divergence = abs(cur_check - entry_est)
+        max_div = sl_d * 0.5
+        if divergence > max_div:
+            log(f"D1[{sym}] ABORT : prix {cur_check} diverge {divergence:.5f} vs entry {entry_est} (max {max_div:.5f})")
+            traded_symbols_h2[sym] = h2_open_t; return False
+    except Exception as e:
+        log(f"D1[{sym}] divergence check err: {e}")
+    p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=D1_HOLD_MIN)
+    if p:
+        log(f"D1[{sym}] *** POSITION H2-BRK {trade_side} (brk={breakout_side}) #{p.ticket} R:R={rr:.2f} eng@{eng_ts.strftime('%H:%M')} ***")
+        await db_insert_position(p)
+        asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], D1_HOLD_MIN))
+        traded_symbols_h2[sym] = h2_open_t  # bloque ce symbole pour ce H2-block
+        return True
+    traded_symbols_h2[sym] = h2_open_t
+    return False
 
 async def d1_breakout_scanner(c):
     """Scanner H2-Breakout : tourne en continu sur les 12 symboles keepers.
-    Prend TOUTES les englobantes strictes apres breakout (multi-trade par creneau H2).
-    Anti-doublon par set de (sym, eng_timestamp)."""
-    log(f"H2-Breakout scanner ON - {len(SETUPS_D1)} symboles - scan every {D1_SCAN_INTERVAL_SEC}s")
-    traded_engulfings = set()  # set de (sym, eng_datetime) deja traites
+    1 seul trade par symbole par creneau H2 (comme backtest valide).
+    traded_symbols_h2 = {sym: h2_open_time} bloque le sym pour le H2-block en cours."""
+    log(f"H2-Breakout scanner ON - {len(SETUPS_D1)} symboles - scan every {D1_SCAN_INTERVAL_SEC}s - 1 trade/sym/H2")
+    # Init: forcer SymbolSelect sur tous les symboles (ajoute au Market Watch MT5)
+    for sym in SETUPS_D1:
+        mt5_sym = MT5_SYM.get(sym, sym)
+        try:
+            await c._rpc('quote', symbol=mt5_sym)
+        except Exception:
+            log(f"WARN: quote init {sym} ({mt5_sym}) failed — symbol may not exist on broker")
+    traded_symbols_h2 = {}  # {sym: h2_open_datetime} → 1 trade par sym par H2-block
     scan_count = 0
     while True:
         try:
@@ -335,7 +397,7 @@ async def d1_breakout_scanner(c):
             today = now.date()
             scan_count += 1
             if scan_count % 30 == 1:  # log every ~5min (30 x 10s)
-                log(f"H2-scan #{scan_count} alive @{now.strftime('%H:%M')} traded_eng={len(traded_engulfings)}")
+                log(f"H2-scan #{scan_count} alive @{now.strftime('%H:%M')} traded_syms={len(traded_symbols_h2)}")
             if in_rollover_window():
                 await asyncio.sleep(60); continue
             # Fermer toutes positions ouvertes 1 min avant rollover
@@ -357,16 +419,16 @@ async def d1_breakout_scanner(c):
             for sym in SETUPS_D1:
                 try:
                     await asyncio.wait_for(
-                        d1_try_breakout_pattern(c, sym, today, traded_engulfings),
+                        d1_try_breakout_pattern(c, sym, today, traded_symbols_h2),
                         timeout=30.0  # max 30s par symbole, evite hang RPC
                     )
                 except asyncio.TimeoutError:
                     log(f"D1[{sym}] TIMEOUT 30s - skip")
                 except Exception as e:
                     log(f"D1[{sym}] try err: {e}")
-            # Cleanup ancien (>4h) pour eviter que le set grossisse indefiniment
+            # Cleanup ancien (>4h) pour eviter que le dict grossisse indefiniment
             cutoff = now - timedelta(hours=4)
-            traded_engulfings = {k for k in traded_engulfings if k[1] >= cutoff}
+            traded_symbols_h2 = {k: v for k, v in traded_symbols_h2.items() if v >= cutoff}
         except Exception as e:
             log(f"d1_breakout_scanner top err: {e}")
         await asyncio.sleep(D1_SCAN_INTERVAL_SEC)
@@ -391,11 +453,12 @@ MT5_SYM = {
     'AUD/USD':'AUDUSD','EUR/JPY':'EURJPY','USD/CHF':'USDCHF','USD/CAD':'USDCAD',
     'CAC40':'FRA40','NKY':'JPN225','GOLD':'XAUUSD','OIL_CRUDE':'XTIUSD',
     'NASDAQ':'NAS100','US30':'US30','HK50':'HK50','DAX40':'GER40',
+    'US500':'US500','UK100':'UK100',
 }
-CONTRACTS = {'NASDAQ':1,'GOLD':100,'OIL_CRUDE':1000,'CAC40':1,'NKY':0.063,'US30':1,'HK50':1,'DAX40':1}
+CONTRACTS = {'NASDAQ':1,'GOLD':100,'OIL_CRUDE':1000,'CAC40':1,'NKY':0.063,'US30':1,'HK50':1,'DAX40':1,'US500':1,'UK100':1}
 FX_TO_EUR = {"USD":1/1.17,"EUR":1.0,"GBP":1/0.86,"JPY":1/(150*1.17),
              "CHF":1.05,"AUD":1/1.65,"CAD":1/1.51,"NZD":1/1.78,"HKD":1/(7.85*1.17)}
-QUOTE_OVERRIDE = {'NASDAQ':'USD','GOLD':'USD','OIL_CRUDE':'USD','CAC40':'EUR','NKY':'JPY','US30':'USD','HK50':'HKD','DAX40':'EUR'}
+QUOTE_OVERRIDE = {'NASDAQ':'USD','GOLD':'USD','OIL_CRUDE':'USD','CAC40':'EUR','NKY':'JPY','US30':'USD','HK50':'HKD','DAX40':'EUR','US500':'USD','UK100':'GBP'}
 FX_CCYS = {"EUR","USD","GBP","JPY","CHF","AUD","NZD","CAD"}
 
 DRY_RUN = os.getenv('STRATV6_DRY_RUN', os.getenv('STRATV2_DRY_RUN', '0')) == '1'  # si 1: pas d'envoi reel
@@ -424,6 +487,7 @@ def pnl_eur(sym, price_diff, lot):
     return price_diff * get_contract(sym) * lot * FX_TO_EUR[get_quote(sym)]
 
 def compute_tp_sl(direction, h1_high, h1_low, h1_close):
+    """Fibo SL/TP classique base sur range H1 (pour setups non-H2-Breakout)."""
     h1r = h1_high - h1_low
     entry = h1_close
     if direction == 'BUY':
@@ -436,6 +500,34 @@ def compute_tp_sl(direction, h1_high, h1_low, h1_close):
         sl_d = tp_d / RR_FLOOR
     else:
         sl_d = sl_d_fibo
+    return tp_d, sl_d
+
+
+def compute_tp_sl_engulfing(direction, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low):
+    """SL/TP ancre sur le pattern englobant, range = H2.
+    BUY: SL = low bougie rouge  - 1/3 range H2
+         TP = high bougie verte + 2/3 range H2
+    SELL: SL = high bougie verte + 1/3 range H2
+          TP = low bougie rouge  - 2/3 range H2
+    Retourne (tp_d, sl_d) = distances depuis eng_close (≈ entry)."""
+    if h2_range <= 0:
+        return 0, 0
+    entry = eng_close
+
+    if direction == 'BUY':
+        sl_price = prev_low - h2_range / 3.0      # sous low rouge de 1/3 range
+        tp_price = eng_high + 2.0 * h2_range / 3.0  # au-dessus high verte de 2/3 range
+        sl_d = entry - sl_price
+        tp_d = tp_price - entry
+    else:
+        sl_price = prev_high + h2_range / 3.0      # au-dessus high verte de 1/3 range
+        tp_price = eng_low - 2.0 * h2_range / 3.0   # sous low rouge de 2/3 range
+        sl_d = sl_price - entry
+        tp_d = entry - tp_price
+
+    # R:R floor — si R:R < 2.0, resserre le SL pour garantir R:R min
+    if sl_d > 0 and tp_d > 0 and tp_d / sl_d < RR_FLOOR:
+        sl_d = tp_d / RR_FLOOR
     return tp_d, sl_d
 
 def compute_lot(sym, sl_d, tp_d, tp_min=None):
@@ -553,6 +645,48 @@ async def db_update_close(ticket: int, close_price: float, pnl_eur: float):
     except Exception as e:
         log(f"DB update_close err: {e}")
 
+def _get_market(sym):
+    """Retourne (market, asset_type) pour un symbole."""
+    if is_forex(sym): return 'forex', 'forex'
+    if sym in ('GOLD', 'OIL_CRUDE'): return 'commodities', 'commodity'
+    if sym in ('NASDAQ', 'US30', 'US500', 'DAX40', 'UK100', 'CAC40', 'NKY', 'HK50'):
+        return 'indices', 'index'
+    return 'other', 'other'
+
+async def db_insert_trade(p, close_price: float, pnl_val: float, exit_reason: str):
+    """Insert trade ferme dans la table trades (historique dashboard)."""
+    if DRY_RUN: return
+    try:
+        market, asset_type = _get_market(p.sym)
+        mt5_sym = MT5_SYM.get(p.sym, p.sym.replace('/', ''))
+        entry_amount = p.entry * p.lot * get_contract(p.sym)
+        conn = await asyncpg.connect(DB_URL)
+        await conn.execute("""
+            INSERT INTO trades (symbol, name, side, status,
+                entry_price, quantity, entry_amount, entry_time,
+                exit_price, exit_time, exit_reason,
+                stop_loss, take_profit,
+                pnl, net_pnl, commission,
+                broker_position_id, source, origin,
+                market, asset_type)
+            VALUES ($1, $2, $3, 'CLOSED',
+                $4, $5, $6, $7,
+                $8, NOW(), $9,
+                $10, $11,
+                $12, $12, 0.0,
+                $13, 'strategy_v6', 'bot',
+                $14, $15)
+        """, mt5_sym, p.sym, p.dr.upper(),
+            p.entry, p.lot, entry_amount, p.opened_at,
+            close_price, exit_reason,
+            p.sl, p.tp,
+            pnl_val,
+            str(p.ticket), market, asset_type)
+        await conn.close()
+        log(f"[DB] Trade saved: {p.sym} {p.dr} {exit_reason} PnL={pnl_val:+.2f}EUR ticket={p.ticket}")
+    except Exception as e:
+        log(f"[DB] insert_trade err: {e}")
+
 # ============================================================================
 # RUNNER
 # ============================================================================
@@ -620,22 +754,19 @@ def get_digits(sym):
     """Retourne le nombre de decimales pour arrondir prix selon le symbole."""
     if 'JPY' in sym.replace('/',''): return 3
     if sym in ('GOLD','XAUUSD'): return 2
-    if sym in ('NASDAQ','NAS100','US30','CAC40','FRA40','DAX40','GER40','NKY','JPN225','HK50'): return 1
+    if sym in ('NASDAQ','NAS100','US30','CAC40','FRA40','DAX40','GER40','NKY','JPN225','HK50','US500','UK100'): return 1
     if sym in ('OIL_CRUDE','XTIUSD'): return 2
     return 5
 
 def round_lot_down(sym, lot):
     """Arrondit DOWN au step broker (jamais d'overshoot du risque)."""
     import math
-    if is_forex(sym): return math.floor(lot * 100) / 100          # forex step 0.01
-    return math.floor(lot * 10) / 10                              # indices/commos step 0.1
+    return math.floor(lot * 100) / 100  # step 0.01 pour tous (Fusion accepte 0.01 indices)
 
 def round_lot(sym, lot):
     """Compat : arrondit DOWN au step (jamais d'overshoot)."""
     rl = round_lot_down(sym, lot)
-    # min step minimum si trop petit
-    if is_forex(sym): return max(0.01, rl)
-    return max(0.1, rl)
+    return max(0.01, rl)
 
 async def open_position(c, sym, dr, lot, sl_d, tp_d, trail_mode, pos_id, hold_min=120):
     # Fix rollover : abort si fenetre rollover Fusion Markets
@@ -715,14 +846,26 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
     digits = get_digits(sym_mt5)
     sign = 1 if p.dr == 'BUY' else -1
     t_end = p.opened_at + timedelta(minutes=hold_min)
+    not_found_count = 0  # compteur anti faux-positif (ZMQ timeout → [] → fausse fermeture)
+    NOT_FOUND_THRESHOLD = 3  # 3 checks consecutifs avant de declarer fermee
     while p.status == 'OPEN' and datetime.now(PARIS) < t_end:
         await asyncio.sleep(8)
         try:
             posb = await c.get_positions()
+            # GUARD: si get_positions retourne [] (erreur ZMQ), ne PAS declarer fermee
+            if not posb:
+                not_found_count += 1
+                if not_found_count < NOT_FOUND_THRESHOLD:
+                    log(f"#{p.pos_id} ticket={p.ticket} get_positions vide ({not_found_count}/{NOT_FOUND_THRESHOLD}), retry...")
+                    continue
             pb = next((x for x in posb if int(x.get('ticket', 0)) == p.ticket), None)
             if pb is None:
+                not_found_count += 1
+                if not_found_count < NOT_FOUND_THRESHOLD:
+                    log(f"#{p.pos_id} ticket={p.ticket} non trouve ({not_found_count}/{NOT_FOUND_THRESHOLD}), retry...")
+                    continue
                 p.status = 'CLOSED'; p.exit_reason = 'BROKER_CLOSE'
-                log(f"#{p.pos_id} ticket={p.ticket} fermee par broker (TP/SL/manuel)")
+                log(f"#{p.pos_id} ticket={p.ticket} fermee par broker (TP/SL/manuel) apres {NOT_FOUND_THRESHOLD} checks")
                 try:
                     d = await c._rpc('deals_by_pos', position_id=p.ticket)
                     items = d.get('items', [])
@@ -730,8 +873,15 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
                         p.exit_price = float(items[-1].get('price', 0))
                         profit = float(items[-1].get('profit', 0))
                         await db_update_close(p.ticket, p.exit_price, profit)
+                        await db_insert_trade(p, p.exit_price, profit, 'broker_close')
+                    else:
+                        # Pas de deal info, estimer le PnL
+                        await db_update_close(p.ticket, cur if 'cur' in dir() else p.entry, 0.0)
+                        await db_insert_trade(p, cur if 'cur' in dir() else p.entry, 0.0, 'broker_close')
                 except Exception as ee: log(f"deals_by_pos err: {ee}")
                 return
+            # Position trouvee → reset compteur
+            not_found_count = 0
             # FIX BUG #3 : fresh quote au lieu de current_price stale
             # FIX BUG #4 : pour fermer BUY on vend au bid, pour fermer SELL on rachete a l'ask
             try:
@@ -750,6 +900,10 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
                 log(f"#{p.pos_id} CUT-LOSS 70% (adv={adv_pct:.1%})")
                 await close_position(c, p, 'EXIT_70')
                 p.status = 'CLOSED'; p.exit_reason = 'EXIT_70'
+                p.exit_price = cur
+                pnl_val = pnl_eur(p.sym, (cur - p.entry) if p.dr == 'BUY' else (p.entry - cur), p.lot)
+                await db_update_close(p.ticket, cur, pnl_val)
+                await db_insert_trade(p, cur, pnl_val, 'stop_loss')
                 continue
             # Cut-loss 5min sustained (DESACTIVE par CUT_LOSS_ENABLED)
             if False and 0.50 <= adv_pct <= 0.65:  # disabled, trop agressif
@@ -759,6 +913,10 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
                     log(f"#{p.pos_id} CUT-LOSS 5MIN (adv={adv_pct:.1%})")
                     await close_position(c, p, 'EXIT_5MIN')
                     p.status = 'CLOSED'; p.exit_reason = 'EXIT_5MIN'
+                    p.exit_price = cur
+                    pnl_val = pnl_eur(p.sym, (cur - p.entry) if p.dr == 'BUY' else (p.entry - cur), p.lot)
+                    await db_update_close(p.ticket, cur, pnl_val)
+                    await db_insert_trade(p, cur, pnl_val, 'stop_loss')
                     continue
             elif adv_pct < 0.50:
                 p.sustain_start = None  # reset uniquement si retour < 50%
@@ -771,8 +929,18 @@ async def manage_position(c, p: Pos, sym_h1_check, mode_cascade, positions_by_se
             log(f"manage err: {e}\n{traceback.format_exc()[:300]}")
     if p.status == 'OPEN':
         log(f"#{p.pos_id} TIMEOUT {hold_min}min, close")
+        # Recuperer prix courant avant close
+        try:
+            q = await c._rpc('quote', symbol=sym_mt5)
+            timeout_price = float(q.get('bid') if p.dr == 'BUY' else q.get('ask'))
+        except:
+            timeout_price = p.entry
         await close_position(c, p, 'TIMEOUT')
         p.status = 'CLOSED'; p.exit_reason = 'TIMEOUT'
+        p.exit_price = timeout_price
+        pnl_val = pnl_eur(p.sym, (timeout_price - p.entry) if p.dr == 'BUY' else (p.entry - timeout_price), p.lot)
+        await db_update_close(p.ticket, timeout_price, pnl_val)
+        await db_insert_trade(p, timeout_price, pnl_val, 'timeout')
 
 async def run_setup(c, h, m, sym, dr, mode_cascade, trail_mode, tf_check='H1', hold_min=120):
     """Execute le cycle complet d'un setup. tf_check='H1' ou 'M15'."""
@@ -964,6 +1132,8 @@ def write_ipc_positions(positions_broker):
             'indicators_snapshot': None,
             'origin': 'strategy_v6', 'source': 'strategy_v6',
             'broker': 'mt5',
+            'market_category': _get_market(sym)[0] if sym else 'other',
+            'asset_type': _get_market(sym)[1] if sym else 'other',
             # sizing
             'position_size': notional_eur,
             'notional_eur': notional_eur,
@@ -972,6 +1142,10 @@ def write_ipc_positions(positions_broker):
             'leverage': leverage,
             'risk_eur': risk_eur,
             'reward_eur': reward_eur,
+            # SL/TP P&L en EUR (pre-calcule pour le dashboard)
+            'sl_pnl_eur': round(-risk_eur, 2) if risk_eur else 0.0,
+            'tp_pnl_eur': round(reward_eur, 2) if reward_eur else 0.0,
+            'pnl_conv_rate': fx_to_eur_q if 'fx_to_eur_q' in dir() else 0.87,
             '_original_tp_dist': tp_d,
             'sl_dist': sl_d, 'tp_dist': tp_d,
             'sl_order_id': None, 'tp_order_id': None,
@@ -1192,9 +1366,8 @@ async def manage_all_loop(c):
                 sl = float(p.get('stop_loss', 0))
                 tp = float(p.get('take_profit', 0))
                 if not (entry and sl and tp): continue
-                sl_d_init = abs(entry - sl)
                 tp_d = abs(tp - entry)
-                if sl_d_init <= 0 or tp_d <= 0: continue
+                if tp_d <= 0: continue
                 # Quote fresh - FIX BUG #4 : pour fermer BUY on vend au bid (= prix sortie reelle)
                 # pour fermer SELL on rachete a l'ask (= prix sortie reelle)
                 try:
@@ -1205,7 +1378,8 @@ async def manage_all_loop(c):
                 fav = max(0, (cur - entry) * sign)
                 adv = max(0, (entry - cur) * sign)
                 fav_pct = fav / tp_d if tp_d > 0 else 0
-                adv_pct = adv / sl_d_init if sl_d_init > 0 else 0
+                sl_d_cur = abs(entry - sl) if abs(entry - sl) > 0 else tp_d  # fallback tp_d si SL=entry
+                adv_pct = adv / sl_d_cur if sl_d_cur > 0 else 0
 
                 # Cut-loss EXIT_70 (DESACTIVE)
                 if CUT_LOSS_ENABLED and adv_pct >= 0.80:
@@ -1260,13 +1434,13 @@ async def manage_all_loop(c):
                     elif fav_pct >= 0.40: new_sl = entry + sign * 0.20 * tp_d
                     elif fav_pct >= 0.30: new_sl = entry  # BE
                 if new_sl is None: continue
-                # Buffer min 5 pips entre SL et prix courant
-                if 'JPY' in sym: min_buffer = 0.05      # JPY 5 pips
-                elif sym in ('GER40','NAS100','US30','FRA40','JPN225','HK50','CAC40','DAX40','NKY'):
-                    min_buffer = 5.0                    # indices 5 pts
-                elif sym in ('XAUUSD',): min_buffer = 0.5     # gold 0.5 USD
-                elif sym in ('XTIUSD',): min_buffer = 0.05    # oil 5 pips
-                else: min_buffer = 0.0005               # forex 5 pips
+                # Buffer min entre SL et prix courant (reduit 2026-05-11, ancien buffer mangeait le trail)
+                if 'JPY' in sym: min_buffer = 0.015     # JPY 1.5 pips
+                elif sym in ('GER40','NAS100','US30','FRA40','JPN225','HK50','CAC40','DAX40','NKY','US500','UK100'):
+                    min_buffer = 1.5                    # indices 1.5 pts
+                elif sym in ('XAUUSD',): min_buffer = 0.15    # gold 0.15 USD
+                elif sym in ('XTIUSD',): min_buffer = 0.015   # oil 1.5 pips
+                else: min_buffer = 0.00015              # forex 1.5 pips
                 # SL ne doit pas etre a moins de buffer du cur (BUY: sl <= cur-buffer ; SELL: sl >= cur+buffer)
                 if side == 'BUY':
                     safe_sl = cur - min_buffer
@@ -1277,7 +1451,7 @@ async def manage_all_loop(c):
                 # Round
                 if 'JPY' in sym: digits = 3
                 elif sym in ('XAUUSD',): digits = 2
-                elif sym in ('NAS100','US30','FRA40','GER40','JPN225','HK50','CAC40','DAX40','NKY'): digits = 1
+                elif sym in ('NAS100','US30','FRA40','GER40','JPN225','HK50','CAC40','DAX40','NKY','US500','UK100'): digits = 1
                 elif sym in ('XTIUSD',): digits = 2
                 else: digits = 5
                 new_sl = round(new_sl, digits)
@@ -1294,14 +1468,19 @@ async def manage_all_loop(c):
             log(f"manage_all_loop err: {e}")
 
 async def reconcile_loop(c):
-    """Toutes les 30s: sync DB <-> broker."""
+    """Toutes les 30s: sync DB <-> broker. Insert aussi dans trades."""
     while True:
         await asyncio.sleep(30)
         try:
             posb = await c.get_positions()
             broker_tickets = {int(p.get('ticket', 0)) for p in posb}
             conn = await asyncpg.connect(DB_URL)
-            db_open = await conn.fetch("SELECT (extra->>'ticket')::bigint AS ticket FROM open_positions WHERE is_open=true AND extra->>'origin'='strategy_v6'")
+            db_open = await conn.fetch("""
+                SELECT (extra->>'ticket')::bigint AS ticket,
+                       symbol, action, entry_price, quantity, stop_loss, take_profit,
+                       opened_at, extra
+                FROM open_positions WHERE is_open=true AND extra->>'origin'='strategy_v6'
+            """)
             for r in db_open:
                 if r['ticket'] not in broker_tickets:
                     try:
@@ -1313,6 +1492,36 @@ async def reconcile_loop(c):
                             await conn.execute("UPDATE open_positions SET is_open=false, closed_at=NOW(), close_price=$1, pnl=$2 WHERE (extra->>'ticket')::bigint=$3 AND is_open=true",
                                                close_price, profit, r['ticket'])
                             log(f"reconcile: ticket {r['ticket']} -> closed pnl={profit}")
+                            # Insert into trades table
+                            extra = r['extra'] if isinstance(r['extra'], dict) else json.loads(r['extra'] or '{}')
+                            sym_name = r['symbol']
+                            mt5_sym = MT5_SYM.get(sym_name, sym_name.replace('/', ''))
+                            dr = r['action']
+                            qty = float(r['quantity'])
+                            entry_p = float(r['entry_price'])
+                            market, asset_type = _get_market(sym_name)
+                            entry_amount = entry_p * qty * get_contract(sym_name)
+                            opened = r['opened_at']
+                            await conn.execute("""
+                                INSERT INTO trades (symbol, name, side, status,
+                                    entry_price, quantity, entry_amount, entry_time,
+                                    exit_price, exit_time, exit_reason,
+                                    stop_loss, take_profit,
+                                    pnl, net_pnl, commission,
+                                    broker_position_id, source, origin,
+                                    market, asset_type)
+                                VALUES ($1, $2, $3, 'CLOSED',
+                                    $4, $5, $6, $7,
+                                    $8, NOW(), 'broker_close',
+                                    $9, $10,
+                                    $11, $11, 0.0,
+                                    $12, 'strategy_v6', 'bot',
+                                    $13, $14)
+                            """, mt5_sym, sym_name, dr.upper(),
+                                entry_p, qty, entry_amount, opened,
+                                close_price, float(r['stop_loss'] or 0), float(r['take_profit'] or 0),
+                                profit, str(r['ticket']), market, asset_type)
+                            log(f"[DB] reconcile trade saved: {sym_name} {dr} PnL={profit:+.2f}")
                     except Exception as e:
                         log(f"reconcile err ticket {r['ticket']}: {e}")
             await conn.close()

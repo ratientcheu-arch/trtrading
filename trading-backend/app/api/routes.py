@@ -843,6 +843,77 @@ async def get_trades_history(days: int = 7):
         return {"days": [], "summary": {"total_pnl": 0, "total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0}}
 
 
+# ── Trade Performance by Market ──────────────────────────────────────────
+
+@router.get("/trades/by-market", dependencies=[Depends(verify_api_key)])
+async def get_trades_by_market(market: str = "commodities", days: int = 30):
+    """Trades filtrés par market (forex, indices, commodities). Ex: /trades/by-market?market=commodities pour Gold."""
+    try:
+        from app.models.trade import Trade, TradeStatus
+        from collections import defaultdict
+
+        start_date = date.today() - timedelta(days=days)
+        async with async_session() as session:
+            result = await session.execute(
+                select(Trade)
+                .where(Trade.status == TradeStatus.CLOSED)
+                .where(Trade.exit_time >= start_date)
+                .where(Trade.market == market)
+                .order_by(Trade.exit_time.desc())
+                .limit(500)
+            )
+            db_trades = result.scalars().all()
+
+        trades_by_week: dict[str, list] = defaultdict(list)
+        for t in db_trades:
+            if t.exit_time:
+                # ISO week key
+                week_key = t.exit_time.strftime("%Y-W%V")
+            elif t.entry_time:
+                week_key = t.entry_time.strftime("%Y-W%V")
+            else:
+                continue
+            trades_by_week[week_key].append({
+                "symbol": t.symbol,
+                "action": t.side.value.upper() if t.side else "BUY",
+                "pnl": round(t.pnl or 0, 2),
+                "reason": t.exit_reason or "",
+                "entry_time": t.entry_time.isoformat() if t.entry_time else "",
+                "exit_time": t.exit_time.isoformat() if t.exit_time else "",
+            })
+
+        weeks = []
+        total_pnl = 0
+        total_trades = 0
+        total_wins = 0
+        for wk in sorted(trades_by_week.keys(), reverse=True):
+            wk_trades = trades_by_week[wk]
+            wk_pnl = sum(t["pnl"] for t in wk_trades)
+            wk_wins = len([t for t in wk_trades if t["pnl"] > 0])
+            weeks.append({
+                "week": wk, "trades": wk_trades,
+                "pnl": round(wk_pnl, 2), "count": len(wk_trades),
+                "wins": wk_wins, "win_rate": round(wk_wins / len(wk_trades) * 100 if wk_trades else 0, 1),
+            })
+            total_pnl += wk_pnl
+            total_trades += len(wk_trades)
+            total_wins += wk_wins
+
+        return {
+            "market": market,
+            "weeks": weeks,
+            "summary": {
+                "total_pnl": round(total_pnl, 2),
+                "total_trades": total_trades,
+                "wins": total_wins,
+                "win_rate": round(total_wins / total_trades * 100 if total_trades else 0, 1),
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch trades by market: {e}")
+        return {"market": market, "weeks": [], "summary": {"total_pnl": 0, "total_trades": 0, "wins": 0, "win_rate": 0}}
+
+
 # ── WebSocket ─────────────────────────────────────────────────────────────
 
 @router.websocket("/ws")
