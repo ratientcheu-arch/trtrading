@@ -71,6 +71,31 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ── H2-Breakout process (strategy_v6_runner) — autonomous strategy ────
+  h2-breakout:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading-h2-breakout
+    command: ["python", "strategy_v6_runner.py"]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${DB_USER:-trading}:${DB_PASSWORD}@postgres:5432/trading"
+      API_KEY: ${API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BOT_IPC_DIR: /ipc
+      MT5_ENABLED: ${MT5_ENABLED:-true}
+      MT5_PUB_ENDPOINT: ${MT5_PUB_ENDPOINT:-tcp://mt5-bridge:5555}
+      MT5_REP_ENDPOINT: ${MT5_REP_ENDPOINT:-tcp://mt5-bridge:5556}
+      MT5_RPC_TIMEOUT_S: ${MT5_RPC_TIMEOUT_S:-10.0}
+    volumes:
+      - ipc-data:/ipc
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mt5-bridge:
+        condition: service_started
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     container_name: trading-proxy
