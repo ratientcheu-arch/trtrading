@@ -1274,7 +1274,9 @@ class TradingBot:
                             "entry_time": _entry_time2 or "",
                             "origin": _origin})
                     from app.ipc import write_json as _wj, POSITIONS_FILE as _PF, ACCOUNT_FILE as _AF, STATUS_FILE as _SF0
-                    _wj(_PF, live)
+                    # 2026-05-15: only write positions if non-empty (strategy_v6_runner is primary writer)
+                    if live:
+                        _wj(_PF, live)
                     # Write account summary — Fusion Markets MT5 capital (primary broker)
                     from app.config import settings as _mon_settings
                     _ic_cap = self.risk_manager.capital
@@ -4903,7 +4905,11 @@ class TradingBot:
                     "entry_time": _entry_time,
                     "origin": _origin,
                 })
-            _wj2(_PF2, live_pos)
+            # 2026-05-15: Don't overwrite with empty list — strategy_v6_runner
+            # is the primary IPC writer (reads ALL MT5 positions every 3s).
+            # Writing [] here causes dashboard flicker when broker data is stale.
+            if live_pos:
+                _wj2(_PF2, live_pos)
         except Exception:
             pass
 
@@ -5508,6 +5514,106 @@ class TradingBot:
                     "stop_loss": stop_loss, "take_profit": take_profit}
         if result and result.get("status") == "REJECTED":
             return {"success": False, "error": result.get("error", f"Ordre rejete pour {symbol}")}
+        return {"success": False, "error": f"Ordre non rempli pour {symbol}: {result}"}
+
+    async def projection_order(self, symbol: str, action: str, tp_price: float) -> dict:
+        """Place a projection order: user provides TP, system calculates SL via ATR and lot for 10€ max risk."""
+        import time as _time
+        from app.trading.projection_sizing import compute_projection, compute_atr_from_candles
+
+        quote = await self._get_quote(symbol)
+        if not quote or not quote.get("price"):
+            return {"success": False, "error": f"Prix indisponible pour {symbol}"}
+        price = float(quote["price"])
+        if price <= 0:
+            return {"success": False, "error": f"Prix invalide pour {symbol}: {price}"}
+
+        h1_candles = (self._candle_cache_h1 or {}).get(symbol) or []
+        if len(h1_candles) < 15:
+            try:
+                h1_candles = await self.mt5.get_historical_candles(symbol, duration="5 D", bar_size="1 hour")
+            except Exception as e:
+                return {"success": False, "error": f"Impossible de charger H1 pour {symbol}: {e}"}
+        if len(h1_candles) < 15:
+            return {"success": False, "error": f"Pas assez de données H1 pour {symbol} ({len(h1_candles)} barres)"}
+
+        atr_h1 = compute_atr_from_candles(h1_candles, period=14)
+        if not atr_h1 or atr_h1 <= 0:
+            return {"success": False, "error": f"ATR H1 incalculable pour {symbol}"}
+
+        proj = compute_projection(symbol, action, price, tp_price, atr_h1)
+        if proj is None:
+            tp_dist = abs(tp_price - price)
+            from app.trading.projection_sizing import MIN_RR, _get_sl_min
+            max_sl = tp_dist / MIN_RR if tp_dist > 0 else 0
+            sl_min = _get_sl_min(symbol)
+            if max_sl < sl_min and tp_dist > 0:
+                min_tp_dist = sl_min * MIN_RR
+                if action.lower() == "buy":
+                    min_tp = round(price + min_tp_dist, 2)
+                else:
+                    min_tp = round(price - min_tp_dist, 2)
+                return {"success": False, "error": (
+                    f"TP trop proche pour R:R≥{MIN_RR} sans stop-hunt. "
+                    f"Distance TP={tp_dist:.2f}, SL requis={max_sl:.5f} < buffer min={sl_min}. "
+                    f"TP minimum: {min_tp}"
+                )}
+            return {"success": False, "error": f"Calcul projection impossible (TP incohérent avec direction ?)"}
+
+        logger.warning(
+            f"[PROJECTION] {symbol} {action.upper()}: entry={proj.entry_price} "
+            f"SL={proj.sl_price} TP={proj.tp_price} lot={proj.lot} "
+            f"risk={proj.risk_eur}€ reward={proj.reward_eur}€ R:R=1:{proj.rr_ratio}"
+        )
+
+        result = await self._place_order(
+            symbol, action.upper(), proj.quantity,
+            stop_loss=proj.sl_price, take_profit=proj.tp_price,
+        )
+
+        if result and result.get("status") == "FILLED":
+            fill_price = result.get("fill_price", price)
+            pos_key = f"{symbol}_proj_{int(_time.time())}"
+            async with self._positions_lock:
+                self._open_positions[pos_key] = {
+                    "symbol": symbol,
+                    "action": action.upper(),
+                    "entry_price": fill_price,
+                    "quantity": proj.quantity,
+                    "stop_loss": proj.sl_price,
+                    "take_profit": proj.tp_price,
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "_opened_ts": _time.time(),
+                    "broker": "mt5",
+                    "manual": True,
+                    "origin": "projection",
+                    "source": "projection",
+                    "signal_reason": (
+                        f"PROJECTION {action.upper()} TP={proj.tp_price} "
+                        f"SL={proj.sl_price} ATR={proj.atr_h1:.5f} lot={proj.lot}"
+                    ),
+                    "sl_order_id": result.get("sl_order_id"),
+                    "tp_order_id": result.get("tp_order_id"),
+                }
+            logger.warning(
+                f"[PROJECTION] FILLED {action.upper()} {symbol} @ {fill_price} "
+                f"lot={proj.lot} SL={proj.sl_price} TP={proj.tp_price} risk={proj.risk_eur}€"
+            )
+            return {
+                "success": True,
+                "fill_price": fill_price,
+                "stop_loss": proj.sl_price,
+                "take_profit": proj.tp_price,
+                "lot": proj.lot,
+                "risk_eur": proj.risk_eur,
+                "reward_eur": proj.reward_eur,
+                "rr_ratio": proj.rr_ratio,
+                "atr_h1": round(proj.atr_h1, 5),
+                "sl_distance": proj.sl_distance,
+            }
+
+        if result and result.get("status") == "REJECTED":
+            return {"success": False, "error": result.get("error", f"Ordre rejeté pour {symbol}")}
         return {"success": False, "error": f"Ordre non rempli pour {symbol}: {result}"}
 
     async def manual_close(self, symbol: str) -> dict:
