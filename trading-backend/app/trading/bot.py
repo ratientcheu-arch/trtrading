@@ -80,10 +80,9 @@ class TradingBot:
         self._process_pool = ProcessPoolExecutor(max_workers=4)  # 4 workers — scan 10s × 24 symbols needs real parallelism
         self.risk_manager = RiskManager()
         self._running = False
-        # 2026-04-25: scan_only = True par DÉFAUT pour désactiver le système de base
-        # (M15 + Body M5 + Volume M5 + Trigger M1). Seuls les triggers horaires
-        # (strategy_schedule) peuvent ouvrir des positions.
-        self._scan_only = True
+        # 2026-05-15: scan_only = False — 4TF réactivé pour trader (score ≥60/100).
+        # Fonctionne en parallèle de strategy_schedule + liquidity_candle + H2-Breakout.
+        self._scan_only = False
         self._scan_interval = 10  # seconds — Scalping mode (was 30s, reduced 2026-04-14 for sub-10s signal-to-order)
         self._open_positions: dict[str, dict] = {}  # pos_key -> position info
         self._positions_lock = asyncio.Lock()
