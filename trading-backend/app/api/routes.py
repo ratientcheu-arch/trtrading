@@ -12,7 +12,7 @@ from typing import Optional
 
 from app.config import settings
 from app.schemas.trade import (
-    ManualOrderRequest, ClosePositionRequest, BotConfigUpdate,
+    ManualOrderRequest, ProjectionOrderRequest, ClosePositionRequest, BotConfigUpdate,
     AccountResponse, HealthResponse,
     ExpectOperatorOrderRequest, ReclassifyPositionRequest, ModifySLRequest,
 )
@@ -149,6 +149,20 @@ async def place_order(req: ManualOrderRequest):
     }, timeout=20)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Order failed"))
+    return result.get("data", result)
+
+
+# ── Projection Orders (manual TP, auto SL/lot sizing) ────────────────────
+
+@router.post("/projection-order", dependencies=[Depends(verify_api_key)])
+async def projection_order(req: ProjectionOrderRequest):
+    result = await send_command("projection_order", {
+        "symbol": req.symbol,
+        "action": req.action,
+        "tp_price": req.tp_price,
+    }, timeout=25)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Projection order failed"))
     return result.get("data", result)
 
 
@@ -706,6 +720,7 @@ async def get_closed_trades(days: int = 30):
                     "duration_min": duration_min,
                     "broker": "mt5",
                     "market": t.market or "",
+                    "origin": t.origin or "bot",
                 })
     except Exception as e:
         logger.error(f"Failed to fetch trade history from DB: {e}")
@@ -766,6 +781,7 @@ async def get_trades_history(days: int = 7):
                     ),
                     "broker": "mt5",
                     "market_category": t.market or "",
+                    "origin": t.origin or "bot",
                 })
 
         # Today's trades from bot memory

@@ -19,6 +19,7 @@ interface LivePos {
   sl_pnl_eur?: number; tp_pnl_eur?: number;
   risk_eur?: number; reward_eur?: number;
   sl_dist?: number; tp_dist?: number;
+  origin?: string;
 }
 
 /** Convertit lots MT5 → unites pour calcul P&L.
@@ -41,6 +42,7 @@ interface ClosedTrade {
   quantity: number; pnl: number; commission?: number;
   reason: string; entry_time: string; exit_time: string;
   duration_min?: number; broker: string; category?: string; market_category?: string;
+  origin?: string;
 }
 
 interface DayGroup {
@@ -79,6 +81,28 @@ const BROKERS = [
   { key: 'mt5', label: 'Fusion Markets' },
 ];
 
+const SOURCES = [
+  { key: 'all', label: 'Tous' },
+  { key: 'h2_breakout', label: 'H2-Breakout' },
+  { key: 'scanner', label: 'Scanner' },
+  { key: 'liq_candle', label: 'Liq. Candle' },
+  { key: 'open_hour', label: 'Open Hour' },
+  { key: 'manual', label: 'Manuel' },
+];
+
+function matchOriginFilter(origin: string | undefined, filterKey: string): boolean {
+  if (filterKey === 'all') return true;
+  const o = (origin || 'bot').toLowerCase();
+  switch (filterKey) {
+    case 'h2_breakout': return o === 'strategy_v6';
+    case 'scanner': return o === 'bot' || o === 'bot_4tf' || o === 'bot_range';
+    case 'liq_candle': return o === 'liquidity_candle';
+    case 'open_hour': return o.startsWith('open_hour');
+    case 'manual': return o === 'manual' || o === 'operator' || o === 'mt5_manual' || o === 'external';
+    default: return true;
+  }
+}
+
 export default function PositionsTab() {
   const [livePositions, setLivePositions] = useState<LivePos[]>([]);
   const [history, setHistory] = useState<HistoryData | null>(null);
@@ -86,6 +110,7 @@ export default function PositionsTab() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [period, setPeriod] = useState(7);
   const [brokerFilter, setBrokerFilter] = useState('all');
+  const [sourceFilter, setSourceFilter] = useState('all');
   const [closing, setClosing] = useState<string | null>(null);
   const [expandedTicket, setExpandedTicket] = useState<number | null>(null);
   const [editingSL, setEditingSL] = useState<number | null>(null);
@@ -212,16 +237,28 @@ export default function PositionsTab() {
   );
 
   // Filter
-  const filteredOpen = brokerFilter === 'all' ? sortedOpen
-    : sortedOpen.filter(p => (p.broker || '').toLowerCase().includes(brokerFilter));
-  const filteredClosed = brokerFilter === 'all' ? allClosed
-    : allClosed.filter(t => (t.broker || '').toLowerCase().includes(brokerFilter));
+  const filteredOpen = sortedOpen
+    .filter(p => brokerFilter === 'all' || (p.broker || '').toLowerCase().includes(brokerFilter))
+    .filter(p => matchOriginFilter(p.origin, sourceFilter));
+  const filteredClosed = allClosed
+    .filter(t => brokerFilter === 'all' || (t.broker || '').toLowerCase().includes(brokerFilter))
+    .filter(t => matchOriginFilter(t.origin, sourceFilter));
 
-  // Stats
-  const totalOpenPnl = livePositions.reduce((s, p) => s + p.pnl, 0);
-  const totalMargin = livePositions.reduce((s, p) => s + (p.margin || 0), 0);
-  const summary = history?.summary || { total_pnl: 0, total_trades: 0, wins: 0, losses: 0, win_rate: 0 };
-  const ctPnl = allClosed.reduce((s, t) => s + t.pnl, 0);
+  // Stats — recalculate from filteredClosed when source filter is active
+  const totalOpenPnl = filteredOpen.reduce((s, p) => s + p.pnl, 0);
+  const totalMargin = filteredOpen.reduce((s, p) => s + (p.margin || 0), 0);
+  const summary = sourceFilter !== 'all' ? (() => {
+    const wins = filteredClosed.filter(t => t.pnl > 0).length;
+    const losses = filteredClosed.filter(t => t.pnl <= 0).length;
+    const total = filteredClosed.length;
+    return {
+      total_pnl: filteredClosed.reduce((s, t) => s + t.pnl, 0),
+      total_trades: total,
+      wins, losses,
+      win_rate: total > 0 ? Math.round(wins / total * 1000) / 10 : 0,
+    };
+  })() : (history?.summary || { total_pnl: 0, total_trades: 0, wins: 0, losses: 0, win_rate: 0 });
+  const ctPnl = filteredClosed.reduce((s, t) => s + t.pnl, 0);
 
   // Exit mode stats
   const exitStats = filteredClosed.reduce((acc, t) => {
@@ -299,6 +336,14 @@ export default function PositionsTab() {
             <button key={b.key} onClick={() => setBrokerFilter(b.key)}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${brokerFilter === b.key ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
               {b.label}
+            </button>
+          ))}
+          <span className="text-xs text-gray-300 mx-1">|</span>
+          <span className="text-xs text-gray-500 font-medium">Source:</span>
+          {SOURCES.map(s => (
+            <button key={s.key} onClick={() => setSourceFilter(s.key)}
+              className={`px-2.5 py-1.5 text-xs font-bold rounded-lg transition-colors ${sourceFilter === s.key ? 'bg-purple-600 text-white shadow-sm' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
+              {s.label}
             </button>
           ))}
         </div>
@@ -411,6 +456,14 @@ export default function PositionsTab() {
                           <span className="text-[9px] text-gray-400 bg-gray-100 px-1 py-0.5 rounded">
                             {atype === 'forex' ? 'Forex' : atype === 'index_cfd' ? 'Index' : atype === 'commodity' ? 'Commodity' : atype === 'stock' ? 'Stock' : 'Other'}
                           </span>
+                          {(() => {
+                            const o = (p.origin || '').toLowerCase();
+                            if (o === 'strategy_v6') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">H2-BK</span>;
+                            if (o === 'liquidity_candle') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">LIQ</span>;
+                            if (o.startsWith('open_hour')) return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-700">OH</span>;
+                            if (o === 'manual' || o === 'operator' || o === 'mt5_manual') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-200 text-gray-600">MAN</span>;
+                            return null;
+                          })()}
                         </div>
                         <div className="text-[11px] text-gray-500 flex items-center gap-2 flex-wrap">
                           <span>Entree: <b>{p.entry_price.toFixed(dec)}</b></span>
@@ -729,6 +782,14 @@ export default function PositionsTab() {
                       {catLabel && catLabel !== 'FOREX' && (
                         <span className="text-[9px] text-gray-400 bg-gray-100 px-1 py-0.5 rounded">{catLabel}</span>
                       )}
+                      {(() => {
+                        const o = (t.origin || 'bot').toLowerCase();
+                        if (o === 'strategy_v6') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">H2-BK</span>;
+                        if (o === 'liquidity_candle') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">LIQ</span>;
+                        if (o.startsWith('open_hour')) return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-700">OH</span>;
+                        if (o === 'manual' || o === 'operator' || o === 'mt5_manual') return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-200 text-gray-600">MAN</span>;
+                        return <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">SCN</span>;
+                      })()}
                     </div>
                     <div className="text-[10px] text-gray-400 mt-0.5">
                       E: {t.entry_price.toFixed(dec)} → S: {t.exit_price.toFixed(dec)}
