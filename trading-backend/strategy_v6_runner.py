@@ -604,8 +604,9 @@ class Pos:
 def update_trail_sl(p, fav_pct):
     """Calcule le nouveau SL selon le mode trail.
     A_15 (H2-Breakout) :
-      Phase 1 (30-44%) : SL = fav - 30% → BE a 30%, 5% a 35%, 10% a 40%
-      Phase 2 (45%+)   : SL = fav - 10% → 35% a 45%, 40% a 50%, etc.
+      Phase 0 (15-24%) : SL réduit de 50% du risque initial (protège le profit naissant)
+      Phase 1 (25-44%) : SL = BE + trail 25% derrière
+      Phase 2 (45%+)   : SL = trail 10% derrière (verrouille les gains)
     """
     sign = 1 if p.dr == 'BUY' else -1
     if p.trail_mode == 'A_15':
@@ -617,6 +618,9 @@ def update_trail_sl(p, fav_pct):
             # Phase 1 : trail 25% derriere (BE a 25%, 5% a 30%, 10% a 35%, 20% a 45%)
             lock = fav_pct - 0.25
             return p.entry + sign * lock * p.tp_d, True
+        if fav_pct >= 0.15:
+            # Phase 0 : SL reduit de 50% du risque initial (evite que profit devienne grosse perte)
+            return p.entry - sign * p.sl_d * 0.50, True
     elif p.trail_mode == 'A_30':
         if fav_pct >= 0.30:
             return p.entry + sign * (fav_pct - 0.30) * p.tp_d, True
@@ -1449,6 +1453,10 @@ async def manage_all_loop(c):
                         # Phase 1 : trail 25% derriere (BE a 25%)
                         lock_pct = fav_pct - 0.25
                         new_sl = entry + sign * lock_pct * tp_d
+                    elif fav_pct >= 0.15:
+                        # Phase 0 : SL reduit de 50% du risque initial (protege profit naissant)
+                        sl_d_initial = abs(entry - sl) if abs(entry - sl) > 0 else tp_d / RR_FLOOR
+                        new_sl = entry - sign * sl_d_initial * 0.50
                 elif mode == 'B_slow':
                     if fav_pct >= 0.30:
                         lock_pct = (fav_pct - 0.30) / 3.0
