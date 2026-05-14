@@ -34,9 +34,18 @@ from app.trading.mt5_client import MT5Client
 # CONFIG
 # ============================================================================
 PARIS = ZoneInfo('Europe/Paris')
-CAP_EUR = 3.0        # 2026-05-08 cap reduit pour valider strict+M5
+CAP_EUR_ASIA = 8.0   # 2026-05-15 session asiatique (22h-08h Paris)
+CAP_EUR_EUUS = 15.0  # 2026-05-15 session EU/US (08h-22h Paris)
+CAP_EUR = CAP_EUR_EUUS  # legacy fallback (non utilise directement)
 TP_EUR_MIN_MOMENTUM = 29.0  # TP min MOMENTUM (Fibo+best-of, R:R 2.0)
 TP_EUR_MIN_ORB      = 21.0  # TP min ORB-Retest (range x1.05/x1.5, R:R 1.43)
+
+def get_cap_eur(now=None):
+    """Cap adaptatif par session : 8€ Asie (22h-08h Paris), 15€ EU/US (08h-22h)."""
+    if now is None: now = datetime.now(PARIS)
+    if now.hour >= 22 or now.hour < 8:
+        return CAP_EUR_ASIA
+    return CAP_EUR_EUUS
 TP_EUR_MIN = TP_EUR_MIN_MOMENTUM  # legacy alias (non utilise par compute_lot apres fix)
 CUT_LOSS_ENABLED = False    # 2026-05-08 sans limite SL pour validation strategy
 # Rollover Fusion Markets : 00:00 serveur (UTC+3) = 23:00 Paris
@@ -91,8 +100,8 @@ D1_HOLD_MIN_ASIA = 60  # 2026-05-14 : session asiatique plus lente, laisser cour
 D1_SCAN_INTERVAL_SEC = 10   # scan toutes les 10s
 
 # === H2-Breakout switch 2026-05-10 (ex H4, backtest H2 >> H4 sur jeu-ven) ===
-H2_CAP_EUR = 3.0
-H2_TP_EUR_MIN = 6.0   # 2026-05-14 : remonte de 5 a 6€ — filtre trades faible potentiel (USDCHF -6€/8min)
+H2_CAP_EUR = CAP_EUR_EUUS  # legacy alias — utiliser get_cap_eur()
+H2_TP_EUR_MIN = 16.0  # 2026-05-15 : TP min = cap_asia * R:R(2.0) = 8*2 = 16€ (plancher conservateur)
 H2_RR = 3.0
 H2_WINDOW_M1 = 118  # 1h58 post-breakout (jusquau prochain H2)
 H2_COOLDOWN_H = 2    # 1 trade par H2-block
@@ -559,12 +568,13 @@ def compute_tp_sl_engulfing(direction, h2_range, prev_low, prev_high, eng_close,
 
 def compute_lot(sym, sl_d, tp_d, tp_min=None):
     if tp_min is None: tp_min = TP_EUR_MIN_MOMENTUM
+    cap = get_cap_eur()
     sl_eur_per_lot = abs(pnl_eur(sym, sl_d, 1.0))
     if sl_eur_per_lot <= 0: return None, "sl_per_lot=0"
-    lot = max(0.001, round(CAP_EUR / sl_eur_per_lot, 4))
+    lot = max(0.001, round(cap / sl_eur_per_lot, 4))
     tp_eur = abs(pnl_eur(sym, tp_d, lot))
     if tp_eur < tp_min - 1.0:
-        return None, f"TP={tp_eur:.1f}€ < {tp_min}€"
+        return None, f"TP={tp_eur:.1f}€ < {tp_min}€ (cap={cap}€)"
     return lot, "OK"
 
 def lot_to_qty(sym, lot):
@@ -805,9 +815,10 @@ async def open_position(c, sym, dr, lot, sl_d, tp_d, trail_mode, pos_id, hold_mi
     lot_raw = lot
     lot = round_lot(sym, lot)
     # SAFETY : si arrondi forced step minimum > 1.5x cap -> REJET (sinon on overshoot le risque)
+    cap = get_cap_eur()
     expected_sl_eur = abs(pnl_eur(sym, sl_d, lot))
-    if expected_sl_eur > CAP_EUR * 1.5:
-        log(f"REJET sizing {sym}: lot arrondi {lot} donne SL={expected_sl_eur:.1f}€ > {CAP_EUR*1.5:.0f}€ (cap*1.5). Lot calcule etait {lot_raw:.4f}.")
+    if expected_sl_eur > cap * 1.5:
+        log(f"REJET sizing {sym}: lot arrondi {lot} donne SL={expected_sl_eur:.1f}€ > {cap*1.5:.0f}€ (cap*1.5). Lot calcule etait {lot_raw:.4f}.")
         return None
     if DRY_RUN:
         log(f"[DRY] would order {dr} {sym_mt5} lot={lot}")
@@ -1102,8 +1113,8 @@ def write_ipc_positions(positions_broker):
         margin_eur = (notional_eur / leverage) if notional_eur and leverage else 0.0
         # Risk reel = SL distance x lot x contract x fx (en EUR)
         try:
-            risk_eur = abs(sl_d * qty * contract * fx_to_eur_q) if sl_d else CAP_EUR
-        except: risk_eur = CAP_EUR
+            risk_eur = abs(sl_d * qty * contract * fx_to_eur_q) if sl_d else get_cap_eur()
+        except: risk_eur = get_cap_eur()
         # Reward potentiel en EUR
         try:
             reward_eur = abs(tp_d * qty * contract * fx_to_eur_q) if tp_d else 0.0
@@ -1213,12 +1224,13 @@ async def handle_command(c, cmd_data):
                 success = True; data = {'ticket': ticket, 'symbol': sym}
                 log(f"close ticket={ticket} ({sym}) OK")
         elif cmd == 'manual_order':
-            # SECURITE V6 : risk plafonne a CAP_EUR (25E) PEU IMPORTE amount_eur recu
+            # SECURITE V6 : risk plafonne a get_cap_eur() PEU IMPORTE amount_eur recu
             sym = params.get('symbol', ''); action = (params.get('action', '') or '').lower()
-            amount_requested = float(params.get('amount_eur', CAP_EUR))
-            amount = min(amount_requested, CAP_EUR)  # HARD CAP €25
-            if amount_requested > CAP_EUR:
-                log(f"manual_order {sym} {action} : amount_eur={amount_requested} > CAP -> CLAMP a €{CAP_EUR}")
+            cap = get_cap_eur()
+            amount_requested = float(params.get('amount_eur', cap))
+            amount = min(amount_requested, cap)  # HARD CAP session
+            if amount_requested > cap:
+                log(f"manual_order {sym} {action} : amount_eur={amount_requested} > CAP({cap}€) -> CLAMP")
             mt5_sym = MT5_SYM.get(sym, sym.replace('/', ''))
             q = await c._rpc('quote', symbol=mt5_sym)
             ref = float(q.get('ask') if action == 'buy' else q.get('bid'))
