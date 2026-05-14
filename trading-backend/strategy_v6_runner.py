@@ -603,23 +603,18 @@ class Pos:
 
 def update_trail_sl(p, fav_pct):
     """Calcule le nouveau SL selon le mode trail.
-    A_15 (H2-Breakout) :
-      Phase 0 (15-24%) : SL réduit de 50% du risque initial (protège le profit naissant)
-      Phase 1 (25-44%) : SL = BE + trail 25% derrière
-      Phase 2 (45%+)   : SL = trail 10% derrière (verrouille les gains)
+    A_15 (H2-Breakout) — 2026-05-14 :
+      Phase 0 (15-19%) : SL réduit de 50% du risque initial (protection profit naissant)
+      Phase 1 (20%+)   : BE + verrouillage 1:1 (21%→lock 1%, 30%→lock 10%, 50%→lock 30%)
     """
     sign = 1 if p.dr == 'BUY' else -1
     if p.trail_mode == 'A_15':
-        if fav_pct >= 0.45:
-            # Phase 2 : trail 10% derriere, verrouille les gains
-            lock = fav_pct - 0.10
-            return p.entry + sign * lock * p.tp_d, True
-        if fav_pct >= 0.25:
-            # Phase 1 : trail 25% derriere (BE a 25%, 5% a 30%, 10% a 35%, 20% a 45%)
-            lock = fav_pct - 0.25
+        if fav_pct >= 0.20:
+            # BE a 20% + trail lineaire 1:1 (chaque 1% de TP gagne = 1% verrouille)
+            lock = fav_pct - 0.20
             return p.entry + sign * lock * p.tp_d, True
         if fav_pct >= 0.15:
-            # Phase 0 : SL reduit de 50% du risque initial (evite que profit devienne grosse perte)
+            # Phase 0 : SL reduit de 50% du risque initial
             return p.entry - sign * p.sl_d * 0.50, True
     elif p.trail_mode == 'A_30':
         if fav_pct >= 0.30:
@@ -1445,16 +1440,12 @@ async def manage_all_loop(c):
                 # Calcul new_sl selon mode
                 new_sl = None
                 if mode == 'A_15' or mode == 'A_30':
-                    if fav_pct >= 0.45:
-                        # Phase 2 : trail 10% derriere
-                        lock_pct = fav_pct - 0.10
-                        new_sl = entry + sign * lock_pct * tp_d
-                    elif fav_pct >= 0.25:
-                        # Phase 1 : trail 25% derriere (BE a 25%)
-                        lock_pct = fav_pct - 0.25
+                    if fav_pct >= 0.20:
+                        # BE a 20% + trail lineaire 1:1 (chaque 1% TP = 1% verrouille)
+                        lock_pct = fav_pct - 0.20
                         new_sl = entry + sign * lock_pct * tp_d
                     elif fav_pct >= 0.15:
-                        # Phase 0 : SL reduit de 50% du risque initial (protege profit naissant)
+                        # Phase 0 : SL reduit de 50% du risque initial
                         sl_d_initial = abs(entry - sl) if abs(entry - sl) > 0 else tp_d / RR_FLOOR
                         new_sl = entry - sign * sl_d_initial * 0.50
                 elif mode == 'B_slow':
