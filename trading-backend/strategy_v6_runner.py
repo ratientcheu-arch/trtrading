@@ -87,11 +87,12 @@ SETUPS_D1 = [
 ]
 D1_WINDOW_M1 = 360  # 6h apres breakout pour chercher engulfing
 D1_HOLD_MIN = 30   # 2026-05-11 : reduit de 60 a 30min
+D1_HOLD_MIN_ASIA = 60  # 2026-05-14 : session asiatique plus lente, laisser courir les gagnants
 D1_SCAN_INTERVAL_SEC = 10   # scan toutes les 10s
 
 # === H2-Breakout switch 2026-05-10 (ex H4, backtest H2 >> H4 sur jeu-ven) ===
 H2_CAP_EUR = 3.0
-H2_TP_EUR_MIN = 5.0   # 2026-05-12 : reduit de 7 a 5€ pour debloquer GOLD, AUDUD, USDCHF, USDCAD
+H2_TP_EUR_MIN = 6.0   # 2026-05-14 : remonte de 5 a 6€ — filtre trades faible potentiel (USDCHF -6€/8min)
 H2_RR = 3.0
 H2_WINDOW_M1 = 118  # 1h58 post-breakout (jusquau prochain H2)
 H2_COOLDOWN_H = 2    # 1 trade par H2-block
@@ -108,6 +109,13 @@ def d1_in_active_hours(sym, now=None):
     start_h = D1_START_HOUR.get(sym)
     if start_h is None: return True  # pas de filtre
     return now.hour >= start_h
+
+def d1_get_hold_min(now=None):
+    """Hold timeout adaptatif : 60 min en session asiatique (22h-08h), 30 min sinon."""
+    if now is None: now = datetime.now(PARIS)
+    if now.hour >= 22 or now.hour < 8:
+        return D1_HOLD_MIN_ASIA
+    return D1_HOLD_MIN
 
 
 def d1_is_bull_engulf(prev, cur):
@@ -346,7 +354,7 @@ async def d1_try_breakout_pattern(c, sym, today, traded_symbols_h2):
     eng_close = m1[i][4]     # close 2eme bougie ≈ entry
     eng_high = m1[i][2]      # high 2eme bougie
     eng_low = m1[i][3]       # low 2eme bougie
-    tp_d, sl_d = compute_tp_sl_engulfing(trade_side, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low)
+    tp_d, sl_d = compute_tp_sl_engulfing(trade_side, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low, sym=sym)
     if sl_d <= 0 or tp_d <= 0:
         traded_symbols_h2[sym] = h2_open_t; return False
     lot, status = compute_lot(sym, sl_d, tp_d, tp_min=H2_TP_EUR_MIN)
@@ -367,11 +375,12 @@ async def d1_try_breakout_pattern(c, sym, today, traded_symbols_h2):
             traded_symbols_h2[sym] = h2_open_t; return False
     except Exception as e:
         log(f"D1[{sym}] divergence check err: {e}")
-    p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=D1_HOLD_MIN)
+    _hold = d1_get_hold_min()
+    p = await open_position(c, sym, trade_side, lot, sl_d, tp_d, 'A_15', pos_id=1, hold_min=_hold)
     if p:
-        log(f"D1[{sym}] *** POSITION H2-BRK {trade_side} (brk={breakout_side}) #{p.ticket} R:R={rr:.2f} eng@{eng_ts.strftime('%H:%M')} ***")
+        log(f"D1[{sym}] *** POSITION H2-BRK {trade_side} (brk={breakout_side}) #{p.ticket} R:R={rr:.2f} eng@{eng_ts.strftime('%H:%M')} hold={_hold}min ***")
         await db_insert_position(p)
-        asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], D1_HOLD_MIN))
+        asyncio.create_task(manage_position(c, p, sym, 'OFF', [p], _hold))
         traded_symbols_h2[sym] = h2_open_t  # bloque ce symbole pour ce H2-block
         return True
     traded_symbols_h2[sym] = h2_open_t
@@ -503,30 +512,48 @@ def compute_tp_sl(direction, h1_high, h1_low, h1_close):
     return tp_d, sl_d
 
 
-def compute_tp_sl_engulfing(direction, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low):
+H2_SL_PAD = {
+    'EUR/USD': 1/3, 'AUD/USD': 1/3, 'NZD/USD': 1/3, 'USD/CAD': 1/3,
+    'EUR/GBP': 1/3, 'EUR/CAD': 1/3, 'AUD/CHF': 1/3, 'AUD/NZD': 1/3,
+    'GBP/USD': 1/2.5,
+    'GBP/JPY': 1/2.5, 'EUR/JPY': 1/2.5, 'AUD/JPY': 1/2.5, 'USD/JPY': 1/2.5,
+    'GBP/AUD': 1/2.5, 'EUR/AUD': 1/2.5, 'USD/CHF': 1/2.5,
+    'DAX40': 1/2.5, 'US30': 1/2.5, 'NASDAQ': 1/2.5, 'US500': 1/2.5,
+    'UK100': 1/2.5, 'CAC40': 1/2.5,
+    'GOLD': 1/2.5,
+}
+RR_REJECT_MIN = 1.5  # R:R naturel en dessous duquel on rejette le trade
+
+def compute_tp_sl_engulfing(direction, h2_range, prev_low, prev_high, eng_close, eng_high, eng_low, sym=None):
     """SL/TP ancre sur le pattern englobant, range = H2.
-    BUY: SL = low bougie rouge  - 1/3 range H2
+    BUY: SL = low bougie rouge  - pad × range H2
          TP = high bougie verte + 2/3 range H2
-    SELL: SL = high bougie verte + 1/3 range H2
+    SELL: SL = high bougie verte + pad × range H2
           TP = low bougie rouge  - 2/3 range H2
-    Retourne (tp_d, sl_d) = distances depuis eng_close (≈ entry)."""
+    Retourne (tp_d, sl_d) = distances depuis eng_close (≈ entry).
+    Retourne (0, 0) si R:R naturel < 1.5 (trade rejete)."""
     if h2_range <= 0:
         return 0, 0
     entry = eng_close
+    sl_pad = H2_SL_PAD.get(sym, 1/3) if sym else 1/3
 
     if direction == 'BUY':
-        sl_price = prev_low - h2_range / 3.0      # sous low rouge de 1/3 range
-        tp_price = eng_high + 2.0 * h2_range / 3.0  # au-dessus high verte de 2/3 range
+        sl_price = prev_low - sl_pad * h2_range
+        tp_price = eng_high + 2.0 * h2_range / 3.0
         sl_d = entry - sl_price
         tp_d = tp_price - entry
     else:
-        sl_price = prev_high + h2_range / 3.0      # au-dessus high verte de 1/3 range
-        tp_price = eng_low - 2.0 * h2_range / 3.0   # sous low rouge de 2/3 range
+        sl_price = prev_high + sl_pad * h2_range
+        tp_price = eng_low - 2.0 * h2_range / 3.0
         sl_d = sl_price - entry
         tp_d = entry - tp_price
 
-    # R:R floor — si R:R < 2.0, resserre le SL pour garantir R:R min
-    if sl_d > 0 and tp_d > 0 and tp_d / sl_d < RR_FLOOR:
+    if sl_d <= 0 or tp_d <= 0:
+        return 0, 0
+    natural_rr = tp_d / sl_d
+    if natural_rr < RR_REJECT_MIN:
+        return 0, 0
+    if natural_rr < RR_FLOOR:
         sl_d = tp_d / RR_FLOOR
     return tp_d, sl_d
 
