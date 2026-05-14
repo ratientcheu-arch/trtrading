@@ -10,7 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY alembic.ini .
 COPY alembic/ ./alembic/
-COPY strategy_v6_runner.py .
 
 # IPC directory for two-process communication
 RUN mkdir -p /ipc
